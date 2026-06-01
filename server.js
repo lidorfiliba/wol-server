@@ -115,6 +115,14 @@ function handleMessage(ws, id, msg) {
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
       // Tell others in the world that a new player joined
       broadcastWorld(p.world, 'playerJoined', { player: pub(p) }, id);
+      // ── Shared monsters: set the world tier and send the current monster list ──
+      if(!NON_SHARED.has(p.world)){
+        const st = worldState(p.world);
+        if(msg.worldTier) st.tier = msg.worldTier;
+        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+        const wb = worldBosses.get(p.world);
+        if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
+      }
       // System chat
       broadcast('chat', { from: 'מערכת', text: `${p.name} התחבר לעולם`, sys: true });
       console.log(`[+] ${p.name} (#${id}) joined ${p.world}. Online: ${players.size}`);
@@ -135,13 +143,96 @@ function handleMessage(ws, id, msg) {
     case 'changeWorld': {
       const p = players.get(id); if (!p) break;
       const oldWorld = p.world;
-      // tell old world we left
       broadcastWorld(oldWorld, 'playerLeft', { id }, id);
       p.world = msg.world;
       p.x = msg.x || 0; p.y = msg.y || 0;
-      // send peers in the new world
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
       broadcastWorld(p.world, 'playerJoined', { player: pub(p) }, id);
+      // shared monsters for the new world
+      if(!NON_SHARED.has(p.world)){
+        const st = worldState(p.world);
+        if(msg.worldTier) st.tier = msg.worldTier;
+        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+      }
+      break;
+    }
+
+    case 'monsterHit': {
+      // a player damaged a shared monster: { mid, damage }
+      const p = players.get(id); if (!p) break;
+      if(NON_SHARED.has(p.world)) break;
+      const st = worldState(p.world);
+      const m = st.monsters.get(msg.mid);
+      if(!m || m.hp<=0) break;
+      m.hp -= Math.max(0, msg.damage|0);
+      if(m.hp<=0){
+        st.monsters.delete(msg.mid);
+        // base XP for this monster (server-authoritative, scales with level)
+        const baseXp = Math.round(20 + (m.level||1)*12);
+        // who shares the XP? the killer's party members in the SAME world, else just the killer.
+        let recipients = [id];
+        let bonus = 1;
+        if(p.partyId && parties.has(p.partyId)){
+          const party = parties.get(p.partyId);
+          const inWorld = [...party.members].filter(mid=>{ const mp=players.get(mid); return mp && mp.world===p.world; });
+          if(inWorld.length>0) recipients = inWorld;
+          // party-size XP bonus: 2→1.15, 3→1.3, 4+ (with distinct classes) →1.5
+          const sz = inWorld.length;
+          const classes = new Set(inWorld.map(mid=>players.get(mid)?.cls));
+          if(sz>=4 && classes.size>=4) bonus = 1.5;
+          else if(sz>=4) bonus = 1.4;
+          else if(sz===3) bonus = 1.3;
+          else if(sz===2) bonus = 1.15;
+        }
+        const sharedXp = Math.round(baseXp * bonus);
+        const sharedGold = Math.round((5 + (m.level||1)*3) * bonus);
+        // tell everyone it died (for the death animation + kill credit)
+        broadcastWorld(p.world, 'monsterDead', { mid: msg.mid, byId: id, byName: p.name, x:Math.round(m.x), y:Math.round(m.y), level:m.level });
+        // grant shared XP + gold to each recipient individually
+        recipients.forEach(mid=>{
+          const mp = players.get(mid);
+          if(mp) send(mp.ws, 'partyXp', { xp: sharedXp, gold: sharedGold, bonus, partySize: recipients.length, from: p.name });
+        });
+      } else {
+        broadcastWorld(p.world, 'monsterHp', { mid: msg.mid, hp: m.hp });
+      }
+      break;
+    }
+
+    case 'monsterMove': {
+      // lightweight: a client (the "host" nearest) nudges a monster's position
+      const p = players.get(id); if (!p || NON_SHARED.has(p.world)) break;
+      const st = worldState(p.world);
+      const m = st.monsters.get(msg.mid);
+      if(m){ m.x = msg.x; m.y = msg.y; }
+      break;
+    }
+
+    case 'worldBossHit': {
+      const p = players.get(id); if(!p) break;
+      const boss = worldBosses.get(p.world);
+      if(!boss || boss.bid!==msg.bid || boss.hp<=0) break;
+      boss.hp -= Math.max(0, msg.damage|0);
+      // track contributors for reward eligibility
+      if(!boss._hitters) boss._hitters = new Set();
+      boss._hitters.add(id);
+      if(boss.hp<=0){
+        worldBosses.delete(p.world);
+        const st = worldState(p.world); st._lastBoss = Date.now();
+        // BIG rewards to everyone who helped + is still in the world
+        const baseXp = 2000 + (boss.level||1)*200;
+        const baseGold = 5000 + (boss.level||1)*300;
+        for(const hid of boss._hitters){
+          const hp_ = players.get(hid);
+          if(hp_ && hp_.world===p.world){
+            send(hp_.ws, 'worldBossReward', { xp:baseXp, gold:baseGold, name:boss.name, killer:p.name });
+          }
+        }
+        broadcastWorld(p.world, 'worldBossDead', { bid:boss.bid, byName:p.name, x:Math.round(boss.x), y:Math.round(boss.y) });
+        broadcast('chat', { from:'מערכת', text:`🏆 ${boss.name} הובס! ${p.name} נתן את המכה הסופית. כל העוזרים תוגמלו!`, sys:true });
+      } else {
+        broadcastWorld(p.world, 'worldBossHp', { bid:boss.bid, hp:boss.hp });
+      }
       break;
     }
 
@@ -277,6 +368,108 @@ function handleDisconnect(id) {
   players.delete(id);
   console.log(`[-] ${p.name} (#${id}) left. Online: ${players.size}`);
 }
+
+// ════════════════════════════════════════════════════════════════
+//  SHARED MONSTERS — the server owns monsters per world so every
+//  player in a world sees and fights the SAME monsters together.
+//  Only "social" overworld zones share monsters (not dungeon/pvp/town).
+// ════════════════════════════════════════════════════════════════
+const WORLD_W = 3000, WORLD_H = 3000;
+// monster archetypes scale by world tier (sent by client on join as worldTier)
+const sharedWorlds = new Map(); // world -> { monsters:Map<mid,{...}>, lastSpawn }
+let nextMid = 1;
+// worlds that are NOT shared (handled fully client-side)
+const NON_SHARED = new Set(['town','arena','forge_dungeon']);
+
+function worldState(world){
+  if(!sharedWorlds.has(world)) sharedWorlds.set(world, { monsters:new Map(), tier:1 });
+  return sharedWorlds.get(world);
+}
+function playersInWorld(world){ let n=0; for(const p of players.values()) if(p.world===world) n++; return n; }
+
+function spawnMonsterFor(world, tier){
+  const st = worldState(world);
+  const mid = 'm'+(nextMid++);
+  // HP/level scale with the world tier the client reported
+  const lvl = 1 + tier*8 + Math.floor(Math.random()*tier*4);
+  const maxHp = Math.round((40 + tier*tier*30) * (1 + Math.random()*0.5));
+  const m = {
+    mid, x: 200+Math.random()*(WORLD_W-400), y: 200+Math.random()*(WORLD_H-400),
+    hp: maxHp, maxHp, level: lvl, tier,
+    kind: Math.floor(Math.random()*4), // visual variant for the client
+    vx:0, vy:0,
+  };
+  st.monsters.set(mid, m);
+  return m;
+}
+
+// Spawn + broadcast loop: keep each populated shared world stocked.
+const MONSTER_CAP = 14;
+setInterval(()=>{
+  for(const [world, st] of sharedWorlds){
+    if(NON_SHARED.has(world)) continue;
+    const pc = playersInWorld(world);
+    if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
+    // spawn up to the cap
+    let spawned=[];
+    while(st.monsters.size < MONSTER_CAP){
+      spawned.push(spawnMonsterFor(world, st.tier||1));
+    }
+    if(spawned.length){
+      broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})) });
+    }
+  }
+}, 2000);
+
+// Periodic light position sync (monsters drift toward nearest player handled client-side;
+// server just keeps authoritative HP + presence and resyncs positions occasionally).
+setInterval(()=>{
+  for(const [world, st] of sharedWorlds){
+    if(NON_SHARED.has(world) || st.monsters.size===0) continue;
+    if(playersInWorld(world)===0) continue;
+    const snap = [...st.monsters.values()].map(m=>({mid:m.mid,x:Math.round(m.x),y:Math.round(m.y),hp:m.hp}));
+    broadcastWorld(world, 'monstersSync', { monsters: snap });
+  }
+}, 1000);
+
+// ════════════════════════════════════════════════════════════════
+//  WORLD BOSS — a giant shared boss with massive HP. Spawns when 2+
+//  players share a world; needs a group to defeat. Everyone in the
+//  world who helped gets big rewards.
+// ════════════════════════════════════════════════════════════════
+const worldBosses = new Map(); // world -> { bid, hp, maxHp, level, x, y, name, spawnedAt, lastSpawn }
+let nextBid = 1;
+const BOSS_NAMES = ['גולגולת התהום','לויתן הצללים','מלך הדרקונים','האל השבור','טיטאן הקדמון'];
+
+setInterval(()=>{
+  for(const [world, st] of sharedWorlds){
+    if(NON_SHARED.has(world)) continue;
+    const pc = playersInWorld(world);
+    const existing = worldBosses.get(world);
+    // clear boss if world emptied
+    if(pc===0){ if(existing) worldBosses.delete(world); continue; }
+    // spawn a world boss if 2+ players and none active and cooldown passed
+    if(pc>=2 && !existing){
+      const last = st._lastBoss||0;
+      if(Date.now()-last > 90000){ // at most one every 90s
+        const tier = st.tier||1;
+        const maxHp = Math.round((8000 + tier*tier*4000) * pc); // scales with players
+        const boss = { bid:'B'+(nextBid++), hp:maxHp, maxHp, level:5+tier*10,
+          x:WORLD_W/2, y:WORLD_H/2, name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
+          spawnedAt:Date.now() };
+        worldBosses.set(world, boss);
+        st._lastBoss = Date.now();
+        broadcastWorld(world, 'worldBossSpawn', { bid:boss.bid, x:boss.x, y:boss.y, hp:boss.hp, maxHp:boss.maxHp, level:boss.level, name:boss.name });
+        broadcast('chat', { from:'מערכת', text:`⚠️ בוס עולם הופיע: ${boss.name}! התאגדו כדי להביסו!`, sys:true });
+      }
+    }
+    // boss despawns if not killed in 5 minutes
+    if(existing && Date.now()-existing.spawnedAt > 300000){
+      worldBosses.delete(world);
+      broadcastWorld(world, 'worldBossGone', { bid:existing.bid });
+    }
+  }
+}, 3000);
 
 // ── Heartbeat: drop dead connections ──────────────────────────────
 const heartbeat = setInterval(() => {
