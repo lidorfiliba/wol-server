@@ -157,6 +157,13 @@ function handleMessage(ws, id, msg) {
       break;
     }
 
+    case 'peerAction': {
+      // relay an attack/skill visual to others in the world
+      const p = players.get(id); if (!p) break;
+      broadcastWorld(p.world, 'peerAction', { id, kind: msg.kind, facing: msg.facing, color: msg.color }, id);
+      break;
+    }
+
     case 'monsterHit': {
       // a player damaged a shared monster: { mid, damage }
       const p = players.get(id); if (!p) break;
