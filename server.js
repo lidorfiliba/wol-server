@@ -584,17 +584,30 @@ function spawnMonsterFor(world, tier){
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
-  // Spawn NEAR an actual player so monsters are always findable (the #1 fix for
-  // "I wandered the map and saw nothing"). Pick a random player in this world and
-  // place the monster in a ring 250-900px around them. Falls back to map centre.
-  const inWorld = [];
-  for(const p of players.values()) if(p.world===world && p.x!=null) inWorld.push(p);
-  let cx = WORLD_W/2, cy = WORLD_H/2;
-  if(inWorld.length){ const anchor = inWorld[Math.floor(Math.random()*inWorld.length)]; cx = anchor.x; cy = anchor.y; }
-  const ang = Math.random()*Math.PI*2;
-  const dist = 250 + Math.random()*650;             // close enough to find quickly
-  const x = Math.max(150, Math.min(WORLD_W-150, cx + Math.cos(ang)*dist));
-  const y = Math.max(150, Math.min(WORLD_H-150, cy + Math.sin(ang)*dist));
+  // ── Spawn in FIXED, SPREAD-OUT cage clusters (training grounds). Cages are
+  //    far apart so the player meets ONE cluster at a time, not a swarm. A few
+  //    monsters also wander as loners between cages. ──
+  if(!st.cages){
+    st.cages=[];
+    // place 6 cages spread across the map, well separated
+    for(let i=0;i<6;i++){
+      let cx,cy,tries=0;
+      do{ cx=900+Math.random()*(WORLD_W-1800); cy=900+Math.random()*(WORLD_H-1800); tries++; }
+      while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<1800));
+      st.cages.push({x:cx,y:cy});
+    }
+  }
+  let x,y;
+  if(Math.random()<0.8){
+    // 80% live in a cage cluster (tight pack)
+    const c=st.cages[Math.floor(Math.random()*st.cages.length)];
+    const a=Math.random()*Math.PI*2, r=Math.random()*300;
+    x=Math.max(150,Math.min(WORLD_W-150, c.x+Math.cos(a)*r));
+    y=Math.max(150,Math.min(WORLD_H-150, c.y+Math.sin(a)*r));
+  } else {
+    // 20% wander as loners
+    x=300+Math.random()*(WORLD_W-600); y=300+Math.random()*(WORLD_H-600);
+  }
   const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0 };
   st.monsters.set(mid, m);
   return m;
@@ -602,9 +615,9 @@ function spawnMonsterFor(world, tier){
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
 // Many more monsters now, and more when extra players are around.
-const MONSTER_BASE = 28;     // baseline monsters per active shared world
-const MONSTER_PER_PLAYER = 6;
-const MONSTER_CAP_MAX = 70;
+const MONSTER_BASE = 24;     // baseline monsters per active shared world
+const MONSTER_PER_PLAYER = 5;
+const MONSTER_CAP_MAX = 54;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
