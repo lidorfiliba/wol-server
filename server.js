@@ -280,7 +280,10 @@ function handleMessage(ws, id, msg) {
       if(!NON_SHARED.has(p.world)){
         const st = worldState(p.world);
         if(msg.worldTier) st.tier = msg.worldTier;
+        if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
+        if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
         send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+        if(st.cages) send(ws, 'cages', { cages: st.cages });
         const wb = worldBosses.get(p.world);
         if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
       }
@@ -313,7 +316,10 @@ function handleMessage(ws, id, msg) {
       if(!NON_SHARED.has(p.world)){
         const st = worldState(p.world);
         if(msg.worldTier) st.tier = msg.worldTier;
+        if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
+        if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
         send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+        if(st.cages) send(ws, 'cages', { cages: st.cages });
       }
       break;
     }
@@ -573,40 +579,41 @@ let nextMid = 1;
 const NON_SHARED = new Set(['town','arena','forge_dungeon']);
 
 function worldState(world){
-  if(!sharedWorlds.has(world)) sharedWorlds.set(world, { monsters:new Map(), tier:1 });
+  if(!sharedWorlds.has(world)) sharedWorlds.set(world, { monsters:new Map(), tier:1, ww:9000, wh:9000 });
   return sharedWorlds.get(world);
 }
 function playersInWorld(world){ let n=0; for(const p of players.values()) if(p.world===world) n++; return n; }
 
 function spawnMonsterFor(world, tier){
   const st = worldState(world);
+  const ww = st.ww || 9000, wh = st.wh || 9000;   // this world's actual size
   const mid = 'm'+(nextMid++);
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
-  // ── Spawn in FIXED, SPREAD-OUT cage clusters (training grounds). Cages are
-  //    far apart so the player meets ONE cluster at a time, not a swarm. A few
-  //    monsters also wander as loners between cages. ──
+  // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds, so
+  //    monsters never appear outside the walkable map. Cages are far apart so the
+  //    player meets one cluster at a time; a few wander as loners. ──
+  const margin = 600;
   if(!st.cages){
     st.cages=[];
-    // place 6 cages spread across the map, well separated
-    for(let i=0;i<6;i++){
+    const minSep = Math.min(1800, Math.max(700, Math.min(ww,wh)/4));
+    const nCages = 6;
+    for(let i=0;i<nCages;i++){
       let cx,cy,tries=0;
-      do{ cx=900+Math.random()*(WORLD_W-1800); cy=900+Math.random()*(WORLD_H-1800); tries++; }
-      while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<1800));
+      do{ cx=margin+Math.random()*(ww-margin*2); cy=margin+Math.random()*(wh-margin*2); tries++; }
+      while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<minSep));
       st.cages.push({x:cx,y:cy});
     }
   }
   let x,y;
-  if(Math.random()<0.8){
-    // 80% live in a cage cluster (tight pack)
+  if(st.cages.length && Math.random()<0.8){
     const c=st.cages[Math.floor(Math.random()*st.cages.length)];
     const a=Math.random()*Math.PI*2, r=Math.random()*300;
-    x=Math.max(150,Math.min(WORLD_W-150, c.x+Math.cos(a)*r));
-    y=Math.max(150,Math.min(WORLD_H-150, c.y+Math.sin(a)*r));
+    x=Math.max(150,Math.min(ww-150, c.x+Math.cos(a)*r));
+    y=Math.max(150,Math.min(wh-150, c.y+Math.sin(a)*r));
   } else {
-    // 20% wander as loners
-    x=300+Math.random()*(WORLD_W-600); y=300+Math.random()*(WORLD_H-600);
+    x=margin/2+Math.random()*(ww-margin); y=margin/2+Math.random()*(wh-margin);
   }
   const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0 };
   st.monsters.set(mid, m);
@@ -632,6 +639,8 @@ setInterval(()=>{
     }
     if(spawned.length){
       broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})) });
+      // send cage positions so clients can draw the fenced pens
+      if(st.cages && !st._cagesSent){ st._cagesSent=true; broadcastWorld(world, 'cages', { cages: st.cages }); }
     }
   }
 }, 800);
@@ -663,19 +672,21 @@ setInterval(()=>{
     const existing = worldBosses.get(world);
     // clear boss if world emptied
     if(pc===0){ if(existing) worldBosses.delete(world); continue; }
-    // spawn a world boss if 2+ players and none active and cooldown passed
-    if(pc>=2 && !existing){
+    // spawn a world boss if 1+ players and none active and cooldown passed
+    if(pc>=1 && !existing){
       const last = st._lastBoss||0;
-      if(Date.now()-last > 90000){ // at most one every 90s
+      if(Date.now()-last > 120000){ // at most one every 2 min
         const tier = st.tier||1;
-        const maxHp = Math.round((8000 + tier*tier*4000) * pc); // scales with players
+        // HP scales with players; solo is beatable with skills/combo, groups face a tankier boss
+        const maxHp = Math.round((6000 + tier*tier*3000) * Math.max(1, pc*0.8));
+        const ww = st.ww||9000, wh = st.wh||9000;
         const boss = { bid:'B'+(nextBid++), hp:maxHp, maxHp, level:5+tier*10,
-          x:WORLD_W/2, y:WORLD_H/2, name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
+          x: ww*0.5, y: wh*0.5, name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
           spawnedAt:Date.now() };
         worldBosses.set(world, boss);
         st._lastBoss = Date.now();
         broadcastWorld(world, 'worldBossSpawn', { bid:boss.bid, x:boss.x, y:boss.y, hp:boss.hp, maxHp:boss.maxHp, level:boss.level, name:boss.name });
-        broadcast('chat', { from:'מערכת', text:`⚠️ בוס עולם הופיע: ${boss.name}! התאגדו כדי להביסו!`, sys:true });
+        broadcast('chat', { from:'מערכת', text:`⚠️ בוס הופיע: ${boss.name}!`, sys:true });
       }
     }
     // boss despawns if not killed in 5 minutes
