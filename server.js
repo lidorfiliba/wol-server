@@ -565,7 +565,7 @@ function handleDisconnect(id) {
 //  player in a world sees and fights the SAME monsters together.
 //  Only "social" overworld zones share monsters (not dungeon/pvp/town).
 // ════════════════════════════════════════════════════════════════
-const WORLD_W = 3000, WORLD_H = 3000;
+const WORLD_W = 9000, WORLD_H = 9000;
 // monster archetypes scale by world tier (sent by client on join as worldTier)
 const sharedWorlds = new Map(); // world -> { monsters:Map<mid,{...}>, lastSpawn }
 let nextMid = 1;
@@ -581,29 +581,34 @@ function playersInWorld(world){ let n=0; for(const p of players.values()) if(p.w
 function spawnMonsterFor(world, tier){
   const st = worldState(world);
   const mid = 'm'+(nextMid++);
-  // Level scales with the world tier, tuned to the actual world level bands
-  // (tier1 meadow≈1-8 ... tier6 volcano≈50-70 ... tier15 oblivion≈240-300).
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
-  // HP MUST track player damage growth (player atk ≈ 30 + lv*3, ~7 hits to kill).
-  // Mirror the client's curve: levelHp = 40 + lv*24, with mild variety. We bias a
-  // bit higher (×1.35) so shared monsters feel meatier and don't die instantly.
-  const variety = 0.85 + Math.random()*0.5;           // 0.85..1.35
+  const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((40 + lvl*24) * variety * 1.35);
-  const m = {
-    mid, x: 200+Math.random()*(WORLD_W-400), y: 200+Math.random()*(WORLD_H-400),
-    hp: maxHp, maxHp, level: lvl, tier,
-    kind: Math.floor(Math.random()*4),
-    vx:0, vy:0,
-  };
+  // Spawn in CAGE clusters (dense training-ground spots) ~70% of the time, else a
+  // wandering loner. Cages are fixed per world so all players see the same spots.
+  if(!st.cages){
+    st.cages=[];
+    for(let i=0;i<8;i++){ st.cages.push({ x:600+Math.random()*(WORLD_W-1200), y:600+Math.random()*(WORLD_H-1200) }); }
+  }
+  let x,y;
+  if(Math.random()<0.7){
+    const c=st.cages[Math.floor(Math.random()*st.cages.length)];
+    const a=Math.random()*Math.PI*2, r=Math.random()*260;
+    x=Math.max(150,Math.min(WORLD_W-150, c.x+Math.cos(a)*r));
+    y=Math.max(150,Math.min(WORLD_H-150, c.y+Math.sin(a)*r));
+  } else {
+    x=200+Math.random()*(WORLD_W-400); y=200+Math.random()*(WORLD_H-400);
+  }
+  const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0 };
   st.monsters.set(mid, m);
   return m;
 }
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
 // Many more monsters now, and more when extra players are around.
-const MONSTER_BASE = 40;     // baseline monsters per active shared world
-const MONSTER_PER_PLAYER = 8;
-const MONSTER_CAP_MAX = 90;
+const MONSTER_BASE = 70;     // baseline monsters per active shared world (big maps)
+const MONSTER_PER_PLAYER = 12;
+const MONSTER_CAP_MAX = 160;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
