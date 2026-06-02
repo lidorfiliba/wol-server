@@ -11,6 +11,35 @@ import { WebSocketServer } from 'ws';
 
 const PORT = process.env.PORT || 8080;
 
+// ════════════════════════════════════════════════════════════════
+//  SUPABASE (server-side) — the server reads/writes authoritative
+//  character economy state using the SERVICE_ROLE key. This key is
+//  set as an environment variable in Render (never in client code).
+//    SUPABASE_URL          = https://xxxx.supabase.co
+//    SUPABASE_SERVICE_KEY  = the service_role key (secret!)
+//  If unset, the server runs in memory-only mode (state not persisted).
+// ════════════════════════════════════════════════════════════════
+const SB_URL = process.env.SUPABASE_URL || '';
+const SB_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SB_ON = !!(SB_URL && SB_KEY);
+function sbHeaders(){ return { apikey: SB_KEY, Authorization: 'Bearer ' + SB_KEY, 'Content-Type': 'application/json' }; }
+function sbUrl(path){ return SB_URL.replace(/\/$/, '') + '/rest/v1/' + path; }
+async function sbSelect(path){
+  if(!SB_ON) return null;
+  try{ const r = await fetch(sbUrl(path), { headers: sbHeaders() }); if(!r.ok) return null; return await r.json(); }
+  catch(e){ console.log('[sb] select error', e.message); return null; }
+}
+async function sbUpsert(table, row, onConflict){
+  if(!SB_ON) return null;
+  try{
+    const r = await fetch(sbUrl(table) + (onConflict?`?on_conflict=${onConflict}`:''), {
+      method:'POST', headers:{...sbHeaders(), Prefer:'resolution=merge-duplicates,return=minimal'},
+      body: JSON.stringify(row) });
+    return r.ok;
+  }catch(e){ console.log('[sb] upsert error', e.message); return null; }
+}
+console.log(SB_ON ? '[sb] Supabase persistence ENABLED' : '[sb] memory-only mode (set SUPABASE_URL + SUPABASE_SERVICE_KEY to persist)');
+
 // ── In-memory state ───────────────────────────────────────────────
 // players: id -> { id, name, cls, level, evoStage, world, x, y, facing, hp, maxHp, ws, lastSeen, partyId }
 const players = new Map();
@@ -20,6 +49,106 @@ let nextPartyId = 1;
 
 let nextId = 1;
 const now = () => Date.now();
+
+// ════════════════════════════════════════════════════════════════
+//  AUTHORITATIVE CHARACTER STATE (Stage 1)
+//  The server owns each character's economy: gold, xp, level.
+//  Keyed by "account:slot". Loaded on join, mutated only by the
+//  server (never set directly from client messages), saved to DB.
+// ════════════════════════════════════════════════════════════════
+const charState = new Map(); // "account:slot" -> { account, slot, gold, xp, level, dirty, lastSave }
+function charKey(account, slot){ return `${account}:${slot|0}`; }
+
+// XP curve must match the client's so levels line up.
+function xpForLevel(lv){ return Math.floor(100 * Math.pow(lv, 1.5)); }
+function applyXp(cs, amount){
+  cs.xp += Math.max(0, amount|0);
+  let leveled = 0;
+  while(cs.level < 250 && cs.xp >= xpForLevel(cs.level)){
+    cs.xp -= xpForLevel(cs.level); cs.level++; leveled++;
+  }
+  cs.dirty = true;
+  return leveled;
+}
+async function loadCharState(account, slot, fallback){
+  const key = charKey(account, slot);
+  if(charState.has(key)) return charState.get(key);
+  let cs = { account, slot:slot|0, gold:0, xp:0, level:1, dirty:false, lastSave:0 };
+  // try DB
+  if(SB_ON && account){
+    const rows = await sbSelect(`wol_charstate?account=eq.${encodeURIComponent(account)}&slot=eq.${slot|0}&select=gold,xp,level`);
+    if(rows && rows.length){ cs.gold = +rows[0].gold||0; cs.xp = +rows[0].xp||0; cs.level = +rows[0].level||1; }
+    else if(fallback){ cs.gold = fallback.gold||0; cs.level = fallback.level||1; cs.dirty = true; } // first migration
+  } else if(fallback){ cs.gold = fallback.gold||0; cs.level = fallback.level||1; }
+  charState.set(key, cs);
+  return cs;
+}
+async function saveCharState(cs){
+  if(!cs || !cs.dirty || !SB_ON || !cs.account) return;
+  cs.dirty = false; cs.lastSave = now();
+  await sbUpsert('wol_charstate', {
+    account: cs.account, slot: cs.slot, gold: Math.round(cs.gold),
+    xp: Math.round(cs.xp), level: cs.level, updated_at: new Date().toISOString(),
+  }, 'account,slot');
+}
+// Periodic save of all dirty character states (every 15s).
+setInterval(()=>{ for(const cs of charState.values()) if(cs.dirty) saveCharState(cs); }, 15000);
+
+
+// ════════════════════════════════════════════════════════════════
+//  ANTI-CHEAT — the server NEVER trusts client-sent values.
+//  Rate-limits every action, caps damage to plausible bounds, and
+//  auto-kicks players who trip too many violations.
+// ════════════════════════════════════════════════════════════════
+const RATE = {            // max messages per sliding window per player
+  monsterHit: { n: 25, win: 1000 },   // ~25 hits/sec max (fast archer is ~6/s)
+  worldBossHit:{ n: 25, win: 1000 },
+  pvpHit:     { n: 20, win: 1000 },
+  chat:       { n: 5,  win: 4000 },    // 5 messages / 4s
+  move:       { n: 30, win: 1000 },
+  monsterMove:{ n: 40, win: 1000 },
+  default:    { n: 60, win: 1000 },
+};
+function rateOk(p, type){
+  if(!p._rl) p._rl = {};
+  const cfg = RATE[type] || RATE.default;
+  const t = now();
+  const b = p._rl[type] || (p._rl[type] = { c: 0, reset: t + cfg.win });
+  if(t > b.reset){ b.c = 0; b.reset = t + cfg.win; }
+  b.c++;
+  if(b.c > cfg.n){ flag(p, `rate:${type}`); return false; }
+  return true;
+}
+// A plausible single-hit damage ceiling for a player at a given level.
+// Real top-end hits scale roughly with level; we allow generous headroom
+// (10x) so legit crits/combos pass, but block the "999999999" cheats.
+function maxPlausibleHit(level){
+  const lv = Math.max(1, Math.min(250, level|0));
+  return Math.round((50 + lv * lv * 1.2) * 10); // lv50≈30k, lv250≈750k ceiling
+}
+function flag(p, reason){
+  if(!p) return;
+  p._violations = (p._violations || 0) + 1;
+  p._lastFlag = reason;
+  if(p._violations === 5 || p._violations === 15) {
+    console.log(`[!] suspicious: ${p.name} (#${p.id}) ${reason} x${p._violations}`);
+  }
+  if(p._violations > 40){ // sustained abuse → kick
+    console.log(`[KICK] ${p.name} (#${p.id}) too many violations (${p._lastFlag})`);
+    try{ send(p.ws, 'kicked', { reason: 'זוהתה פעילות חשודה' }); p.ws.close(); }catch(e){}
+  }
+}
+function sanitizeText(s){
+  return String(s||'').replace(/[\u0000-\u001f\u007f]/g,'').slice(0,180);
+}
+
+// Block names that impersonate staff (mirror of the client check).
+function isReservedServerName(name){
+  const norm = (name||'').toLowerCase().replace(/[\s._\-|]/g,'')
+    .replace(/0/g,'o').replace(/1/g,'i').replace(/3/g,'e').replace(/4/g,'a').replace(/5/g,'s').replace(/7/g,'t');
+  return /(gm|admin|owner|mod|staff|support|official|system|server|root|developer|gamemaster|moderator|lidor)/.test(norm);
+}
+
 
 // ── Helpers ───────────────────────────────────────────────────────
 function send(ws, type, data) {
@@ -99,18 +228,38 @@ function handleMessage(ws, id, msg) {
   switch (msg.type) {
     case 'join': {
       // msg: { name, cls, level, evoStage, world, x, y }
+      // Defense-in-depth: reject impersonator names server-side too.
+      let safeName = (msg.name || 'גיבור').slice(0, 16);
+      if(isReservedServerName(safeName)){
+        send(ws, 'kicked', { reason: 'שם זה שמור ואינו זמין' });
+        try{ ws.close(); }catch(e){}
+        break;
+      }
       const p = {
         id,
-        name: (msg.name || 'גיבור').slice(0, 16),
+        name: safeName,
         cls: msg.cls || 'warrior',
-        level: msg.level || 1,
-        evoStage: msg.evoStage || 0,
+        level: Math.max(1, Math.min(250, msg.level|0 || 1)),
+        evoStage: Math.max(0, Math.min(3, msg.evoStage|0)),
         world: msg.world || 'meadow',
         x: msg.x || 0, y: msg.y || 0, facing: 1,
-        hp: msg.hp || 100, maxHp: msg.maxHp || 100,
+        hp: msg.hp || 100, maxHp: Math.max(1, Math.min(50000000, msg.maxHp|0 || 100)),
         ws, lastSeen: now(),
       };
       players.set(id, p);
+      // ── Stage 1: load this character's AUTHORITATIVE economy (gold/xp/level).
+      //    account+slot identify the character; we seed from the client's claimed
+      //    values ONLY on first load (migration), then the server owns them. ──
+      p.account = (msg.account || '').slice(0,40);
+      p.slot = msg.slot|0;
+      if(p.account){
+        loadCharState(p.account, p.slot, { gold: msg.gold|0, level: p.level }).then(cs=>{
+          p._cs = cs;
+          // server's values are authoritative — push them to the client
+          p.level = cs.level;
+          send(ws, 'charState', { gold: Math.round(cs.gold), xp: Math.round(cs.xp), level: cs.level });
+        });
+      }
       // Send the new player the list of everyone already in their world
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
       // Tell others in the world that a new player joined
@@ -168,10 +317,14 @@ function handleMessage(ws, id, msg) {
       // a player damaged a shared monster: { mid, damage }
       const p = players.get(id); if (!p) break;
       if(NON_SHARED.has(p.world)) break;
+      if(!rateOk(p, 'monsterHit')) break;
       const st = worldState(p.world);
       const m = st.monsters.get(msg.mid);
       if(!m || m.hp<=0) break;
-      m.hp -= Math.max(0, msg.damage|0);
+      // CAP damage to a plausible value for this player's level (anti one-shot cheat)
+      const dmg = Math.max(0, Math.min(maxPlausibleHit(p.level), msg.damage|0));
+      if((msg.damage|0) > maxPlausibleHit(p.level)*1.5) flag(p,'dmg:monster');
+      m.hp -= dmg;
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
         // base XP for this monster (server-authoritative, scales with level)
@@ -195,10 +348,20 @@ function handleMessage(ws, id, msg) {
         const sharedGold = Math.round((5 + (m.level||1)*3) * bonus);
         // tell everyone it died (for the death animation + kill credit)
         broadcastWorld(p.world, 'monsterDead', { mid: msg.mid, byId: id, byName: p.name, x:Math.round(m.x), y:Math.round(m.y), level:m.level });
-        // grant shared XP + gold to each recipient individually
+        // grant shared XP + gold to each recipient — into their AUTHORITATIVE state.
         recipients.forEach(mid=>{
           const mp = players.get(mid);
-          if(mp) send(mp.ws, 'partyXp', { xp: sharedXp, gold: sharedGold, bonus, partySize: recipients.length, from: p.name });
+          if(!mp) return;
+          if(mp._cs){
+            mp._cs.gold += sharedGold;
+            const leveled = applyXp(mp._cs, sharedXp);
+            mp.level = mp._cs.level;
+            // send the new authoritative totals (client just displays them)
+            send(mp.ws, 'charState', { gold: Math.round(mp._cs.gold), xp: Math.round(mp._cs.xp), level: mp._cs.level, gainXp: sharedXp, gainGold: sharedGold, bonus, leveled });
+          } else {
+            // no account/state yet — fall back to the old client-side grant
+            send(mp.ws, 'partyXp', { xp: sharedXp, gold: sharedGold, bonus, partySize: recipients.length, from: p.name });
+          }
         });
       } else {
         broadcastWorld(p.world, 'monsterHp', { mid: msg.mid, hp: m.hp });
@@ -217,9 +380,12 @@ function handleMessage(ws, id, msg) {
 
     case 'worldBossHit': {
       const p = players.get(id); if(!p) break;
+      if(!rateOk(p, 'worldBossHit')) break;
       const boss = worldBosses.get(p.world);
       if(!boss || boss.bid!==msg.bid || boss.hp<=0) break;
-      boss.hp -= Math.max(0, msg.damage|0);
+      const dmg = Math.max(0, Math.min(maxPlausibleHit(p.level), msg.damage|0));
+      if((msg.damage|0) > maxPlausibleHit(p.level)*1.5) flag(p,'dmg:boss');
+      boss.hp -= dmg;
       // track contributors for reward eligibility
       if(!boss._hitters) boss._hitters = new Set();
       boss._hitters.add(id);
@@ -245,18 +411,20 @@ function handleMessage(ws, id, msg) {
 
     case 'chat': {
       const p = players.get(id); if (!p) break;
-      const text = (msg.text || '').slice(0, 200);
+      if(!rateOk(p, 'chat')) break; // spam guard
+      const text = sanitizeText(msg.text);
       if (!text.trim()) break;
       broadcast('chat', { from: p.name, level: p.level, text, fromId: id });
       break;
     }
 
     case 'stats': {
-      // periodic level/hp/evolution update
+      // periodic level/hp/evolution update — CLAMP to valid ranges (anti fake-rank)
       const p = players.get(id); if (!p) break;
-      if (msg.level != null) p.level = msg.level;
-      if (msg.evoStage != null) p.evoStage = msg.evoStage;
-      if (msg.maxHp != null) p.maxHp = msg.maxHp;
+      if (!rateOk(p, 'default')) break;
+      if (msg.level != null) p.level = Math.max(1, Math.min(250, msg.level|0));
+      if (msg.evoStage != null) p.evoStage = Math.max(0, Math.min(3, msg.evoStage|0));
+      if (msg.maxHp != null) p.maxHp = Math.max(1, Math.min(50000000, msg.maxHp|0));
       broadcastWorld(p.world, 'peerStats',
         { id, level: p.level, evoStage: p.evoStage, maxHp: p.maxHp }, id);
       break;
@@ -270,10 +438,13 @@ function handleMessage(ws, id, msg) {
       const attacker = players.get(id);
       const victim = players.get(msg.targetId);
       if (!attacker || !victim) break;
+      if (!rateOk(attacker, 'pvpHit')) break;
       if (attacker.world !== victim.world) break;          // must be same map
       // no friendly fire within a party
       if (attacker.partyId && attacker.partyId === victim.partyId) break;
-      const dmg = Math.max(1, Math.min(999999, msg.damage | 0));
+      // cap PvP damage to the attacker's plausible max (anti one-shot)
+      const dmg = Math.max(1, Math.min(maxPlausibleHit(attacker.level), msg.damage | 0));
+      if((msg.damage|0) > maxPlausibleHit(attacker.level)*1.5) flag(attacker,'dmg:pvp');
       send(victim.ws, 'pvpHurt', {
         fromId: id, fromName: attacker.name, damage: dmg,
         knockX: msg.knockX || 0, knockY: msg.knockY || 0,
@@ -369,6 +540,7 @@ function leaveParty(id) {
 function handleDisconnect(id) {
   const p = players.get(id);
   if (!p) return;
+  if (p._cs) saveCharState(p._cs); // persist authoritative economy on leave
   leaveParty(id);
   broadcastWorld(p.world, 'playerLeft', { id }, id);
   broadcast('chat', { from: 'מערכת', text: `${p.name} התנתק`, sys: true });
