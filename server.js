@@ -622,9 +622,9 @@ function spawnMonsterFor(world, tier){
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
 // Many more monsters now, and more when extra players are around.
-const MONSTER_BASE = 24;     // baseline monsters per active shared world
-const MONSTER_PER_PLAYER = 5;
-const MONSTER_CAP_MAX = 54;
+const MONSTER_BASE = 48;     // baseline monsters per active shared world (denser cages)
+const MONSTER_PER_PLAYER = 8;
+const MONSTER_CAP_MAX = 108;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
@@ -672,10 +672,10 @@ setInterval(()=>{
     const existing = worldBosses.get(world);
     // clear boss if world emptied
     if(pc===0){ if(existing) worldBosses.delete(world); continue; }
-    // spawn a world boss if 1+ players and none active and cooldown passed
+    // spawn a world boss if 1+ players, none active, and the 1-hour cooldown passed
     if(pc>=1 && !existing){
       const last = st._lastBoss||0;
-      if(Date.now()-last > 120000){ // at most one every 2 min
+      if(Date.now()-last > 3600000){ // ONE boss per hour per world
         const tier = st.tier||1;
         // HP scales with players; solo is beatable with skills/combo, groups face a tankier boss
         const maxHp = Math.round((6000 + tier*tier*3000) * Math.max(1, pc*0.8));
