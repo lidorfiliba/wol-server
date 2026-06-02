@@ -60,7 +60,19 @@ const charState = new Map(); // "account:slot" -> { account, slot, gold, xp, lev
 function charKey(account, slot){ return `${account}:${slot|0}`; }
 
 // XP curve must match the client's so levels line up.
-function xpForLevel(lv){ return Math.floor(100 * Math.pow(lv, 1.5)); }
+// XP curve — MUST be byte-for-byte identical to the client's so the XP bar and
+// level-ups line up exactly between server and game.
+function xpForLevel(lv){
+  if(lv <= 30)  return Math.round(80 * Math.pow(1.15, lv-1));
+  const b30 = 80 * Math.pow(1.15, 29);
+  if(lv <= 80)  return Math.round(b30 * (1 + (lv-30)*0.12));
+  const b80 = b30 * (1 + 50*0.12);
+  if(lv <= 130) return Math.round(b80 * Math.pow(1.055, lv-80));
+  const b130 = b80 * Math.pow(1.055, 50);
+  if(lv <= 200) return Math.round(b130 * Math.pow(1.045, lv-130));
+  const b200 = b130 * Math.pow(1.045, 70);
+  return Math.round(b200 * (1 + (lv-200)*0.08));
+}
 function applyXp(cs, amount){
   cs.xp += Math.max(0, amount|0);
   let leveled = 0;
