@@ -569,13 +569,18 @@ function playersInWorld(world){ let n=0; for(const p of players.values()) if(p.w
 function spawnMonsterFor(world, tier){
   const st = worldState(world);
   const mid = 'm'+(nextMid++);
-  // HP/level scale with the world tier the client reported
-  const lvl = 1 + tier*8 + Math.floor(Math.random()*tier*4);
-  const maxHp = Math.round((40 + tier*tier*30) * (1 + Math.random()*0.5));
+  // Level scales with the world tier, tuned to the actual world level bands
+  // (tier1 meadow≈1-8 ... tier6 volcano≈50-70 ... tier15 oblivion≈240-300).
+  const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
+  // HP MUST track player damage growth (player atk ≈ 30 + lv*3, ~7 hits to kill).
+  // Mirror the client's curve: levelHp = 40 + lv*24, with mild variety. We bias a
+  // bit higher (×1.35) so shared monsters feel meatier and don't die instantly.
+  const variety = 0.85 + Math.random()*0.5;           // 0.85..1.35
+  const maxHp = Math.round((40 + lvl*24) * variety * 1.35);
   const m = {
     mid, x: 200+Math.random()*(WORLD_W-400), y: 200+Math.random()*(WORLD_H-400),
     hp: maxHp, maxHp, level: lvl, tier,
-    kind: Math.floor(Math.random()*4), // visual variant for the client
+    kind: Math.floor(Math.random()*4),
     vx:0, vy:0,
   };
   st.monsters.set(mid, m);
@@ -583,22 +588,27 @@ function spawnMonsterFor(world, tier){
 }
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
-const MONSTER_CAP = 14;
+// Many more monsters now, and more when extra players are around.
+const MONSTER_BASE = 40;     // baseline monsters per active shared world
+const MONSTER_PER_PLAYER = 8;
+const MONSTER_CAP_MAX = 90;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
     const pc = playersInWorld(world);
     if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
-    // spawn up to the cap
+    const cap = Math.min(MONSTER_CAP_MAX, MONSTER_BASE + pc*MONSTER_PER_PLAYER);
+    // spawn gradually (up to 8 per tick) so they trickle in naturally
     let spawned=[];
-    while(st.monsters.size < MONSTER_CAP){
+    let budget = 8;
+    while(st.monsters.size < cap && budget-- > 0){
       spawned.push(spawnMonsterFor(world, st.tier||1));
     }
     if(spawned.length){
       broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})) });
     }
   }
-}, 2000);
+}, 800);
 
 // Periodic light position sync (monsters drift toward nearest player handled client-side;
 // server just keeps authoritative HP + presence and resyncs positions occasionally).
