@@ -584,21 +584,17 @@ function spawnMonsterFor(world, tier){
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((40 + lvl*24) * variety * 1.35);
-  // Spawn in CAGE clusters (dense training-ground spots) ~70% of the time, else a
-  // wandering loner. Cages are fixed per world so all players see the same spots.
-  if(!st.cages){
-    st.cages=[];
-    for(let i=0;i<8;i++){ st.cages.push({ x:600+Math.random()*(WORLD_W-1200), y:600+Math.random()*(WORLD_H-1200) }); }
-  }
-  let x,y;
-  if(Math.random()<0.7){
-    const c=st.cages[Math.floor(Math.random()*st.cages.length)];
-    const a=Math.random()*Math.PI*2, r=Math.random()*260;
-    x=Math.max(150,Math.min(WORLD_W-150, c.x+Math.cos(a)*r));
-    y=Math.max(150,Math.min(WORLD_H-150, c.y+Math.sin(a)*r));
-  } else {
-    x=200+Math.random()*(WORLD_W-400); y=200+Math.random()*(WORLD_H-400);
-  }
+  // Spawn NEAR an actual player so monsters are always findable (the #1 fix for
+  // "I wandered the map and saw nothing"). Pick a random player in this world and
+  // place the monster in a ring 250-900px around them. Falls back to map centre.
+  const inWorld = [];
+  for(const p of players.values()) if(p.world===world && p.x!=null) inWorld.push(p);
+  let cx = WORLD_W/2, cy = WORLD_H/2;
+  if(inWorld.length){ const anchor = inWorld[Math.floor(Math.random()*inWorld.length)]; cx = anchor.x; cy = anchor.y; }
+  const ang = Math.random()*Math.PI*2;
+  const dist = 250 + Math.random()*650;             // close enough to find quickly
+  const x = Math.max(150, Math.min(WORLD_W-150, cx + Math.cos(ang)*dist));
+  const y = Math.max(150, Math.min(WORLD_H-150, cy + Math.sin(ang)*dist));
   const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0 };
   st.monsters.set(mid, m);
   return m;
