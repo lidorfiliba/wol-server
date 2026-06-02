@@ -118,7 +118,7 @@ const RATE = {            // max messages per sliding window per player
   pvpHit:     { n: 20, win: 1000 },
   chat:       { n: 5,  win: 4000 },    // 5 messages / 4s
   move:       { n: 30, win: 1000 },
-  monsterMove:{ n: 40, win: 1000 },
+  monsterMove:{ n: 400, win: 1000 },
   default:    { n: 60, win: 1000 },
 };
 function rateOk(p, type){
