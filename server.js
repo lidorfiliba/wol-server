@@ -583,7 +583,7 @@ function spawnMonsterFor(world, tier){
   const mid = 'm'+(nextMid++);
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
-  const maxHp = Math.round((90 + lvl*42) * variety * 1.35);
+  const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
   // Spawn NEAR an actual player so monsters are always findable (the #1 fix for
   // "I wandered the map and saw nothing"). Pick a random player in this world and
   // place the monster in a ring 250-900px around them. Falls back to map centre.
