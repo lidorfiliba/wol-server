@@ -119,6 +119,15 @@ async function saveCharState(cs){
 }
 // Periodic save of all dirty character states (every 15s).
 setInterval(()=>{ for(const cs of charState.values()) if(cs.dirty) saveCharState(cs); }, 15000);
+// SECURITY: every 20s, push each online player their AUTHORITATIVE gold/level so any
+// client-side tampering of the displayed values self-corrects (the server owns them).
+setInterval(()=>{
+  for(const p of players.values()){
+    if(p._cs && p.ws && p.ws.readyState===p.ws.OPEN){
+      send(p.ws, 'charState', { gold: Math.round(p._cs.gold), xp: Math.round(p._cs.xp), level: p._cs.level, reconcile:true });
+    }
+  }
+}, 20000);
 
 
 // ════════════════════════════════════════════════════════════════
