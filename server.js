@@ -347,7 +347,10 @@ function handleMessage(ws, id, msg) {
       m.hp -= dmg;
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
-        st.lastDeath = Date.now();   // arm the 10s respawn cooldown
+        // per-cage respawn timer: record when this cage last lost a monster, so
+        // each cage refills independently ~5s after being cleared.
+        if(!st.cageKill) st.cageKill = {};
+        if(m.cage>=0) st.cageKill[m.cage] = Date.now();
         // base XP — matches the client formula (8 + lv^1.5 * 0.55) so progression
         // is identical online and offline.
         const baseXp = Math.max(4, Math.round(8 + Math.pow(m.level||1, 1.5)*0.55));
@@ -603,39 +606,42 @@ function ensureCages(st){
   }
   return st.cages;
 }
-function spawnMonsterFor(world, tier){
+// Spawn a monster into a SPECIFIC cage (cageIdx). Used by the per-cage respawn.
+function spawnMonsterForCage(world, tier, cageIdx){
   const st = worldState(world);
-  const ww = st.ww || 9000, wh = st.wh || 9000;   // this world's actual size
+  const ww = st.ww || 9000, wh = st.wh || 9000;
   const mid = 'm'+(nextMid++);
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
-  // tougher monsters: ~2.2x HP so they take several hits (not 2). Matches the
-  // client-side bump in makeMonster so shared HP stays consistent.
-  const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 2.2);
-  // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds. ──
-  const CAGE_R = 280; // pack radius inside a pen
-  const margin = 600;
+  const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 2.2); // tougher (matches client)
+  const CAGE_R = 280;
   ensureCages(st);
-  let x,y, cageIdx=-1;
-  if(st.cages.length && Math.random()<0.85){
-    // count current population per cage, then fill the EMPTIEST one (so a cage
-    // the player just cleared gets repopulated instead of random scattering).
-    const counts = new Array(st.cages.length).fill(0);
-    for(const mm of st.monsters.values()){
-      if(mm.cage>=0 && mm.cage<counts.length) counts[mm.cage]++;
-    }
-    let best=0; for(let i=1;i<counts.length;i++){ if(counts[i]<counts[best]) best=i; }
-    cageIdx=best;
-    const c=st.cages[best];
+  let x, y;
+  if(cageIdx>=0 && cageIdx<st.cages.length){
+    const c=st.cages[cageIdx];
     const a=Math.random()*Math.PI*2, r=Math.random()*CAGE_R;
     x=Math.max(150,Math.min(ww-150, c.x+Math.cos(a)*r));
     y=Math.max(150,Math.min(wh-150, c.y+Math.sin(a)*r));
   } else {
+    const margin=600;
     x=margin/2+Math.random()*(ww-margin); y=margin/2+Math.random()*(wh-margin);
   }
   const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0, cage:cageIdx };
   st.monsters.set(mid, m);
   return m;
+}
+// Spawn into the EMPTIEST cage (used for initial population).
+function spawnMonsterFor(world, tier){
+  const st = worldState(world);
+  ensureCages(st);
+  let cageIdx = -1;
+  if(st.cages.length){
+    const counts = new Array(st.cages.length).fill(0);
+    for(const mm of st.monsters.values()){ if(mm.cage>=0 && mm.cage<counts.length) counts[mm.cage]++; }
+    let best=0; for(let i=1;i<counts.length;i++){ if(counts[i]<counts[best]) best=i; }
+    cageIdx = best;
+  }
+  return spawnMonsterForCage(world, tier, cageIdx);
 }
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
@@ -650,25 +656,39 @@ setInterval(()=>{
     if(NON_SHARED.has(world)) continue;
     const pc = playersInWorld(world);
     if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
+    ensureCages(st);
+    const nCages = st.cages.length || 6;
     const cap = Math.min(MONSTER_CAP_MAX, MONSTER_BASE + pc*MONSTER_PER_PLAYER);
-    // ── RESPAWN DELAY: after a kill, wait ~10s before refilling. This gives a
-    //    real lull (cleared cages stay clear for a bit) instead of instant refill. ──
-    if(st.monsters.size >= cap) continue;             // already full
-    const sinceDeath = Date.now() - (st.lastDeath||0);
-    if(st.lastDeath && sinceDeath < 10000) continue;  // still in the 10s cooldown
-    // refill (a burst once the cooldown passes), then arm the next cooldown
+    const perCage = Math.max(6, Math.floor(cap / nCages)); // target monsters per cage
+    if(!st.cageKill) st.cageKill = {};
+    const nowMs = Date.now();
+
+    // count current population per cage
+    const counts = new Array(nCages).fill(0);
+    for(const mm of st.monsters.values()){
+      if(mm.cage>=0 && mm.cage<nCages) counts[mm.cage]++;
+    }
+
+    // refill each cage INDEPENDENTLY, 5s after it was last cleared/reduced
     let spawned=[];
-    let budget = 16;
-    while(st.monsters.size < cap && budget-- > 0){
-      spawned.push(spawnMonsterFor(world, st.tier||1));
+    for(let ci=0; ci<nCages; ci++){
+      if(counts[ci] >= perCage) continue;               // this cage is full
+      const lastKill = st.cageKill[ci] || 0;
+      if(lastKill && (nowMs - lastKill) < 5000) continue; // 5s lull for THIS cage
+      // refill this cage up to its target (cap the burst so it's smooth)
+      let budget = 8;
+      while(counts[ci] < perCage && budget-- > 0){
+        spawned.push(spawnMonsterForCage(world, st.tier||1, ci));
+        counts[ci]++;
+      }
+      st.cageKill[ci] = 0; // refilled — clear this cage's timer
     }
     if(spawned.length){
-      st.lastDeath = 0; // refilled — clear the cooldown marker
       broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})) });
       if(st.cages && !st._cagesSent){ st._cagesSent=true; broadcastWorld(world, 'cages', { cages: st.cages }); }
     }
   }
-}, 800);
+}, 1000);
 
 // Periodic light position sync (monsters drift toward nearest player handled client-side;
 // server just keeps authoritative HP + presence and resyncs positions occasionally).
