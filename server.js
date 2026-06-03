@@ -282,7 +282,7 @@ function handleMessage(ws, id, msg) {
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
         if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
-        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
         if(st.cages) send(ws, 'cages', { cages: st.cages });
         const wb = worldBosses.get(p.world);
         if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
@@ -318,7 +318,7 @@ function handleMessage(ws, id, msg) {
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
         if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
-        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})), full:true });
+        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
         if(st.cages) send(ws, 'cages', { cages: st.cages });
       }
       break;
@@ -645,7 +645,7 @@ setInterval(()=>{
       spawned.push(spawnMonsterFor(world, st.tier||1));
     }
     if(spawned.length){
-      broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind})) });
+      broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})) });
       // send cage positions so clients can draw the fenced pens
       if(st.cages && !st._cagesSent){ st._cagesSent=true; broadcastWorld(world, 'cages', { cages: st.cages }); }
     }
