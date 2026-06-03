@@ -282,8 +282,9 @@ function handleMessage(ws, id, msg) {
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
         if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
-        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
-        if(st.cages) send(ws, 'cages', { cages: st.cages });
+        ensureCages(st);
+        send(ws, "cages", { cages: st.cages });
+        send(ws, "monstersSpawn", { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
         const wb = worldBosses.get(p.world);
         if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
       }
@@ -318,8 +319,9 @@ function handleMessage(ws, id, msg) {
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
         if(msg.worldH && msg.worldH!==st.wh){ st.wh = msg.worldH; st.cages = null; st._cagesSent=false; }
-        send(ws, 'monstersSpawn', { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
-        if(st.cages) send(ws, 'cages', { cages: st.cages });
+        ensureCages(st);
+        send(ws, "cages", { cages: st.cages });
+        send(ws, "monstersSpawn", { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
       }
       break;
     }
@@ -584,6 +586,21 @@ function worldState(world){
 }
 function playersInWorld(world){ let n=0; for(const p of players.values()) if(p.world===world) n++; return n; }
 
+function ensureCages(st){
+  if(st.cages) return st.cages;
+  const ww = st.ww || 9000, wh = st.wh || 9000;
+  const margin = 600;
+  st.cages=[];
+  const minSep = Math.min(1800, Math.max(700, Math.min(ww,wh)/4));
+  const nCages = 6;
+  for(let i=0;i<nCages;i++){
+    let cx,cy,tries=0;
+    do{ cx=margin+Math.random()*(ww-margin*2); cy=margin+Math.random()*(wh-margin*2); tries++; }
+    while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<minSep));
+    st.cages.push({x:cx,y:cy});
+  }
+  return st.cages;
+}
 function spawnMonsterFor(world, tier){
   const st = worldState(world);
   const ww = st.ww || 9000, wh = st.wh || 9000;   // this world's actual size
@@ -592,19 +609,9 @@ function spawnMonsterFor(world, tier){
   const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
   // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds. ──
-  const margin = 600;
   const CAGE_R = 280; // pack radius inside a pen
-  if(!st.cages){
-    st.cages=[];
-    const minSep = Math.min(1800, Math.max(700, Math.min(ww,wh)/4));
-    const nCages = 6;
-    for(let i=0;i<nCages;i++){
-      let cx,cy,tries=0;
-      do{ cx=margin+Math.random()*(ww-margin*2); cy=margin+Math.random()*(wh-margin*2); tries++; }
-      while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<minSep));
-      st.cages.push({x:cx,y:cy});
-    }
-  }
+  const margin = 600;
+  ensureCages(st);
   let x,y, cageIdx=-1;
   if(st.cages.length && Math.random()<0.85){
     // count current population per cage, then fill the EMPTIEST one (so a cage
