@@ -109,6 +109,7 @@ async function loadCharState(account, slot, fallback){
   charState.set(key, cs);
   return cs;
 }
+function currentWeekId(){ return Math.floor(Date.now()/(7*24*60*60*1000)); }
 async function saveCharState(cs){
   if(!cs || !cs.dirty || !SB_ON || !cs.account) return;
   cs.dirty = false; cs.lastSave = now();
@@ -119,6 +120,25 @@ async function saveCharState(cs){
 }
 // Periodic save of all dirty character states (every 15s).
 setInterval(()=>{ for(const cs of charState.values()) if(cs.dirty) saveCharState(cs); }, 15000);
+// SECURITY: the server writes the AUTHORITATIVE leaderboard row from its own trusted
+// state (gold/level/kills), so a tampered client can't post a fake top rank. Runs
+// every 30s for online players. (The client's own push only affects cosmetic fields.)
+setInterval(()=>{
+  if(!SB_ON) return;
+  for(const p of players.values()){
+    if(!p._cs || !p.account) continue;
+    const wk = currentWeekId();
+    sbUpsert('wol_leaderboard', {
+      username: p.account, slot: p.slot|0, name: String(p.name||'').slice(0,16),
+      class_id: p.cls||'warrior',
+      level: Math.max(1,Math.min(250, p._cs.level|0)),
+      kills: Math.max(0, Math.min(99999999, p._serverKills|0)),
+      gold: Math.max(0, Math.min(5000000, Math.round(p._cs.gold))),
+      week_id: wk, updated_at: new Date().toISOString(),
+    }, 'username,slot').catch(()=>{});
+  }
+}, 30000);
+
 // SECURITY: every 20s, push each online player their AUTHORITATIVE gold/level so any
 // client-side tampering of the displayed values self-corrects (the server owns them).
 setInterval(()=>{
@@ -142,6 +162,11 @@ const RATE = {            // max messages per sliding window per player
   chat:       { n: 5,  win: 4000 },    // 5 messages / 4s
   move:       { n: 30, win: 1000 },
   monsterMove:{ n: 400, win: 1000 },
+  peerAction: { n: 30, win: 1000 },    // visual attack broadcasts
+  changeWorld:{ n: 8,  win: 4000 },    // can't thrash worlds
+  partyHeal:  { n: 12, win: 1000 },    // healer pulse
+  social:     { n: 6,  win: 3000 },    // invites/trade requests — anti-spam
+  tradeEdit:  { n: 20, win: 2000 },    // trade offer tweaks
   default:    { n: 60, win: 1000 },
 };
 function rateOk(p, type){
@@ -250,8 +275,16 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (raw) => {
+    // SECURITY: drop oversized frames (anti memory-abuse) and throttle raw packet
+    // rate per connection (anti-flood / DoS) before any parsing.
+    if(raw && raw.length > 16000){ return; }            // 16KB hard cap per message
+    const tnow = Date.now();
+    ws._pk = ws._pk || { c:0, reset: tnow+1000 };
+    if(tnow > ws._pk.reset){ ws._pk.c = 0; ws._pk.reset = tnow+1000; }
+    if(++ws._pk.c > 200){ return; }                      // >200 msgs/sec from one socket → drop
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if(!msg || typeof msg!=='object' || typeof msg.type!=='string') return; // malformed
     handleMessage(ws, id, msg);
   });
 
@@ -266,6 +299,8 @@ function handleMessage(ws, id, msg) {
   switch (msg.type) {
     case 'join': {
       // msg: { name, cls, level, evoStage, world, x, y }
+      const existing = players.get(id);
+      if(existing && existing._joinT && (now()-existing._joinT) < 1000){ break; } // ignore rapid re-joins
       // Defense-in-depth: reject impersonator names server-side too.
       let safeName = (msg.name || 'גיבור').slice(0, 16);
       if(isReservedServerName(safeName)){
@@ -285,6 +320,7 @@ function handleMessage(ws, id, msg) {
         ws, lastSeen: now(),
       };
       players.set(id, p);
+      p._joinT = now();
       // ── Stage 1: load this character's AUTHORITATIVE economy (gold/xp/level).
       //    account+slot identify the character; we seed from the client's claimed
       //    values ONLY on first load (migration), then the server owns them. ──
@@ -333,8 +369,12 @@ function handleMessage(ws, id, msg) {
 
     case 'changeWorld': {
       const p = players.get(id); if (!p) break;
+      if(!rateOk(p, 'changeWorld')) break;
+      if(typeof msg.world!=='string' || msg.world.length>60) break; // sanity
       const oldWorld = p.world;
       broadcastWorld(oldWorld, 'playerLeft', { id }, id);
+      // leaving a world cancels any pending trade tied to the old location
+      if(p._tradeWith){ const o=players.get(p._tradeWith); if(o){ o._tradeWith=null; o._tradeOffer=null; send(o.ws,'tradeCancelled',{byId:id}); } p._tradeWith=null; p._tradeOffer=null; }
       p.world = msg.world;
       p.x = msg.x || 0; p.y = msg.y || 0;
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
@@ -355,6 +395,7 @@ function handleMessage(ws, id, msg) {
     case 'peerAction': {
       // relay an attack/skill visual to others in the world
       const p = players.get(id); if (!p) break;
+      if(!rateOk(p, 'peerAction')) break;
       broadcastWorld(p.world, 'peerAction', { id, kind: msg.kind, facing: msg.facing, color: msg.color }, id);
       break;
     }
@@ -413,6 +454,8 @@ function handleMessage(ws, id, msg) {
         // tell everyone it died (for the death animation + kill credit)
         broadcastWorld(p.world, 'monsterDead', { mid: msg.mid, byId: id, byName: p.name, x:Math.round(m.x), y:Math.round(m.y), level:m.level });
         // grant shared XP + gold to each recipient — into their AUTHORITATIVE state.
+        // credit the killer with an authoritative kill (used for the trusted leaderboard)
+        p._serverKills = (p._serverKills|0) + 1;
         recipients.forEach(mid=>{
           const mp = players.get(mid);
           if(!mp) return;
@@ -517,8 +560,9 @@ function handleMessage(ws, id, msg) {
       // no friendly fire within a party
       if (attacker.partyId && attacker.partyId === victim.partyId) break;
       // cap PvP damage to the attacker's plausible max (anti one-shot)
-      const dmg = Math.max(1, Math.min(maxPlausibleHit(attacker.level), msg.damage | 0));
-      if((msg.damage|0) > maxPlausibleHit(attacker.level)*1.5) flag(attacker,'dmg:pvp');
+      const _alvl = (attacker._cs && attacker._cs.level) ? attacker._cs.level : attacker.level;
+      const dmg = Math.max(1, Math.min(maxPlausibleHit(_alvl), msg.damage | 0));
+      if((msg.damage|0) > maxPlausibleHit(_alvl)*8) flag(attacker,'dmg:pvp');
       send(victim.ws, 'pvpHurt', {
         fromId: id, fromName: attacker.name, damage: dmg,
         knockX: msg.knockX || 0, knockY: msg.knockY || 0,
@@ -556,7 +600,8 @@ function handleMessage(ws, id, msg) {
     }
     case 'partyInvite': {
       const p = players.get(id), target = players.get(msg.targetId);
-      if (!p || !target || !p.partyId) break;
+      if (!p || !rateOk(p,'social')) break;
+      if (!target || !p.partyId) break;
       send(target.ws, 'partyInvited', { fromId: id, fromName: p.name, partyId: p.partyId });
       break;
     }
@@ -577,7 +622,8 @@ function handleMessage(ws, id, msg) {
     // ── HEALER PALADIN: relay a heal pulse to nearby party members ──
     case 'partyHeal': {
       const p = players.get(id);
-      if(!p || !p.partyId || !parties.has(p.partyId)) break;
+      if(!p || !rateOk(p,'partyHeal')) break;
+      if(!p.partyId || !parties.has(p.partyId)) break;
       const amt = Math.max(0, Math.min(99999, msg.amount|0));
       if(amt<=0) break;
       const party = parties.get(p.partyId);
@@ -593,7 +639,8 @@ function handleMessage(ws, id, msg) {
     // ── PLAYER TRADE (relayed; the swap itself is confirmed on both clients) ──
     case 'tradeRequest': {
       const p = players.get(id), target = players.get(msg.targetId);
-      if(!p || !target || p.world!==target.world) break;
+      if(!p || !rateOk(p,'social')) break;
+      if(!target || p.world!==target.world) break;
       if(p._tradeWith || target._tradeWith) { send(p.ws,'tradeBusy',{}); break; }
       send(target.ws, 'tradeRequested', { fromId: id, fromName: p.name, level: p.level });
       break;
@@ -614,7 +661,7 @@ function handleMessage(ws, id, msg) {
       break;
     }
     case 'tradeOffer': {
-      const p = players.get(id); if(!p || !p._tradeWith) break;
+      const p = players.get(id); if(!p || !rateOk(p,'tradeEdit') || !p._tradeWith) break;
       const other = players.get(p._tradeWith); if(!other) break;
       // SECURITY: clamp the offered gold to what the server says this player ACTUALLY
       // has (authoritative _cs.gold). You can't offer gold you don't own.
