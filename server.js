@@ -113,8 +113,8 @@ setInterval(()=>{ for(const cs of charState.values()) if(cs.dirty) saveCharState
 //  auto-kicks players who trip too many violations.
 // ════════════════════════════════════════════════════════════════
 const RATE = {            // max messages per sliding window per player
-  monsterHit: { n: 25, win: 1000 },   // ~25 hits/sec max (fast archer is ~6/s)
-  worldBossHit:{ n: 25, win: 1000 },
+  monsterHit: { n: 120, win: 1000 },  // generous: melee can hit many monsters per swing, fast attackers burst
+  worldBossHit:{ n: 60, win: 1000 },
   pvpHit:     { n: 20, win: 1000 },
   chat:       { n: 5,  win: 4000 },    // 5 messages / 4s
   move:       { n: 30, win: 1000 },
@@ -136,7 +136,10 @@ function rateOk(p, type){
 // (10x) so legit crits/combos pass, but block the "999999999" cheats.
 function maxPlausibleHit(level){
   const lv = Math.max(1, Math.min(250, level|0));
-  return Math.round((50 + lv * lv * 1.2) * 10); // lv50≈30k, lv250≈750k ceiling
+  // headroom must cover the biggest legit hit: ultimate (×20) × crit (×2) × combo
+  // finisher (×9) plus gear/awakening. We use a very generous ×400 so NO legitimate
+  // hit is ever flagged; the clamp below still caps the actual damage applied.
+  return Math.round((50 + lv * lv * 1.2) * 400);
 }
 function flag(p, reason){
   if(!p) return;
@@ -343,7 +346,9 @@ function handleMessage(ws, id, msg) {
       if(!m || m.hp<=0) break;
       // CAP damage to a plausible value for this player's level (anti one-shot cheat)
       const dmg = Math.max(0, Math.min(maxPlausibleHit(p.level), msg.damage|0));
-      if((msg.damage|0) > maxPlausibleHit(p.level)*1.5) flag(p,'dmg:monster');
+      // Only flag truly absurd values (×8 over the already-generous ceiling) so that
+      // legitimate big hits (ultimate+crit+combo) are clamped silently, never kicked.
+      if((msg.damage|0) > maxPlausibleHit(p.level)*8) flag(p,'dmg:monster');
       m.hp -= dmg;
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
@@ -650,13 +655,12 @@ function spawnMonsterFor(world, tier){
   return spawnMonsterForCage(world, tier, cageIdx);
 }
 
-// Spawn + broadcast loop: keep each populated shared world stocked.
-// Many more monsters now, and more when extra players are around.
-// Fewer, tougher monsters: ~12 per cage (was ~22) so fights are about skill,
-// not crowd-clearing. Higher HP is applied in spawnMonsterFor (×2.2).
-const MONSTER_BASE = 72;     // ~12 per cage across 6 cages
-const MONSTER_PER_PLAYER = 8;
-const MONSTER_CAP_MAX = 110;
+// Monster density: ~18 per cage (engaging but not a mindless swarm). Tougher HP
+// (×2.2 in spawn) means each one is a real fight. Snappy ~4s per-cage respawn.
+const MONSTER_BASE = 108;    // ~18 per cage across 6 cages
+const MONSTER_PER_PLAYER = 10;
+const MONSTER_CAP_MAX = 170;
+const CAGE_RESPAWN_MS = 4000; // a cage starts refilling 4s after it was reduced
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(isNonShared(world)) continue;
@@ -665,7 +669,7 @@ setInterval(()=>{
     ensureCages(st);
     const nCages = st.cages.length || 6;
     const cap = Math.min(MONSTER_CAP_MAX, MONSTER_BASE + pc*MONSTER_PER_PLAYER);
-    const perCage = Math.max(6, Math.floor(cap / nCages)); // target monsters per cage
+    const perCage = Math.max(8, Math.floor(cap / nCages)); // target monsters per cage
     if(!st.cageKill) st.cageKill = {};
     const nowMs = Date.now();
 
@@ -675,19 +679,21 @@ setInterval(()=>{
       if(mm.cage>=0 && mm.cage<nCages) counts[mm.cage]++;
     }
 
-    // refill each cage INDEPENDENTLY, 5s after it was last cleared/reduced
+    // refill each cage INDEPENDENTLY toward its target, ~4s after it was reduced.
+    // This is INFINITE: every tick that a cage is below target (and past its lull),
+    // it tops up — so cleared cages always come back.
     let spawned=[];
     for(let ci=0; ci<nCages; ci++){
-      if(counts[ci] >= perCage) continue;               // this cage is full
+      if(counts[ci] >= perCage) continue;                 // this cage is full
       const lastKill = st.cageKill[ci] || 0;
-      if(lastKill && (nowMs - lastKill) < 5000) continue; // 5s lull for THIS cage
-      // refill this cage up to its target (cap the burst so it's smooth)
+      if(lastKill && (nowMs - lastKill) < CAGE_RESPAWN_MS) continue; // brief lull
+      // top this cage up toward its target (smooth burst per tick)
       let budget = 8;
       while(counts[ci] < perCage && budget-- > 0){
         spawned.push(spawnMonsterForCage(world, st.tier||1, ci));
         counts[ci]++;
       }
-      st.cageKill[ci] = 0; // refilled — clear this cage's timer
+      st.cageKill[ci] = 0; // refilled this cage — clear its timer so it can refill again next time it's reduced
     }
     if(spawned.length){
       broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})) });
@@ -702,8 +708,11 @@ setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(isNonShared(world) || st.monsters.size===0) continue;
     if(playersInWorld(world)===0) continue;
-    const snap = [...st.monsters.values()].map(m=>({mid:m.mid,x:Math.round(m.x),y:Math.round(m.y),hp:m.hp}));
-    broadcastWorld(world, 'monstersSync', { monsters: snap });
+    // FULL reconciliation: send enough for the client to add monsters it's missing
+    // and drop ones the server no longer has. This self-heals any desync (e.g. a
+    // client optimistically removed a monster whose hit got dropped).
+    const snap = [...st.monsters.values()].map(m=>({mid:m.mid,x:Math.round(m.x),y:Math.round(m.y),hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage}));
+    broadcastWorld(world, 'monstersSync', { monsters: snap, reconcile:true });
   }
 }, 1000);
 
