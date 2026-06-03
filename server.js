@@ -530,6 +530,61 @@ function handleMessage(ws, id, msg) {
       leaveParty(id);
       break;
     }
+    // ── PLAYER TRADE (relayed; the swap itself is confirmed on both clients) ──
+    case 'tradeRequest': {
+      const p = players.get(id), target = players.get(msg.targetId);
+      if(!p || !target || p.world!==target.world) break;
+      if(p._tradeWith || target._tradeWith) { send(p.ws,'tradeBusy',{}); break; }
+      send(target.ws, 'tradeRequested', { fromId: id, fromName: p.name, level: p.level });
+      break;
+    }
+    case 'tradeAccept': {
+      const p = players.get(id), other = players.get(msg.fromId);
+      if(!p || !other || p.world!==other.world) break;
+      if(p._tradeWith || other._tradeWith){ send(p.ws,'tradeBusy',{}); break; }
+      p._tradeWith = other.id; other._tradeWith = p.id;
+      p._tradeOffer = {items:[],gold:0,confirm:false}; other._tradeOffer = {items:[],gold:0,confirm:false};
+      send(p.ws, 'tradeStart', { withId: other.id, withName: other.name });
+      send(other.ws, 'tradeStart', { withId: p.id, withName: p.name });
+      break;
+    }
+    case 'tradeDecline': {
+      const other = players.get(msg.fromId);
+      if(other) send(other.ws, 'tradeDeclined', { byId: id });
+      break;
+    }
+    case 'tradeOffer': {
+      const p = players.get(id); if(!p || !p._tradeWith) break;
+      const other = players.get(p._tradeWith); if(!other) break;
+      // updating an offer resets BOTH confirmations (anti-switch scam)
+      p._tradeOffer = { items: Array.isArray(msg.items)?msg.items.slice(0,12):[], gold: Math.max(0, msg.gold|0), confirm:false };
+      if(other._tradeOffer) other._tradeOffer.confirm = false;
+      send(p.ws,    'tradeUpdate', { mine: p._tradeOffer, theirs: other._tradeOffer||{items:[],gold:0,confirm:false} });
+      send(other.ws,'tradeUpdate', { mine: other._tradeOffer||{items:[],gold:0,confirm:false}, theirs: p._tradeOffer });
+      break;
+    }
+    case 'tradeConfirm': {
+      const p = players.get(id); if(!p || !p._tradeWith) break;
+      const other = players.get(p._tradeWith); if(!other) break;
+      if(p._tradeOffer) p._tradeOffer.confirm = true;
+      // when BOTH confirmed → execute: tell each client what it RECEIVES and GIVES
+      if(p._tradeOffer && other._tradeOffer && p._tradeOffer.confirm && other._tradeOffer.confirm){
+        send(p.ws,    'tradeComplete', { give: p._tradeOffer, receive: other._tradeOffer });
+        send(other.ws,'tradeComplete', { give: other._tradeOffer, receive: p._tradeOffer });
+        p._tradeWith=null; p._tradeOffer=null; other._tradeWith=null; other._tradeOffer=null;
+      } else {
+        send(p.ws,    'tradeUpdate', { mine: p._tradeOffer, theirs: other._tradeOffer||{items:[],gold:0,confirm:false} });
+        send(other.ws,'tradeUpdate', { mine: other._tradeOffer||{items:[],gold:0,confirm:false}, theirs: p._tradeOffer });
+      }
+      break;
+    }
+    case 'tradeCancel': {
+      const p = players.get(id); if(!p) break;
+      const other = p._tradeWith ? players.get(p._tradeWith) : null;
+      p._tradeWith=null; p._tradeOffer=null;
+      if(other){ other._tradeWith=null; other._tradeOffer=null; send(other.ws, 'tradeCancelled', { byId: id }); }
+      break;
+    }
   }
 }
 
@@ -571,6 +626,8 @@ function handleDisconnect(id) {
   const p = players.get(id);
   if (!p) return;
   if (p._cs) saveCharState(p._cs); // persist authoritative economy on leave
+  // cancel any in-progress trade so the partner isn't left hanging
+  if(p._tradeWith){ const other=players.get(p._tradeWith); if(other){ other._tradeWith=null; other._tradeOffer=null; send(other.ws,'tradeCancelled',{byId:id}); } }
   leaveParty(id);
   broadcastWorld(p.world, 'playerLeft', { id }, id);
   broadcast('chat', { from: 'מערכת', text: `${p.name} התנתק`, sys: true });
@@ -608,11 +665,13 @@ function ensureCages(st){
   const margin = 600;
   st.cages=[];
   const minSep = Math.min(1800, Math.max(700, Math.min(ww,wh)/4));
+  const SPAWN_CLEAR = 700; // keep cages away from the center spawn outpost (~280r + buffer)
+  const cxC = ww/2, cyC = wh/2;
   const nCages = 6;
   for(let i=0;i<nCages;i++){
     let cx,cy,tries=0;
     do{ cx=margin+Math.random()*(ww-margin*2); cy=margin+Math.random()*(wh-margin*2); tries++; }
-    while(tries<30 && st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<minSep));
+    while(tries<40 && ( st.cages.some(c=>Math.hypot(c.x-cx,c.y-cy)<minSep) || Math.hypot(cx-cxC,cy-cyC)<SPAWN_CLEAR ));
     st.cages.push({x:cx,y:cy});
   }
   return st.cages;
