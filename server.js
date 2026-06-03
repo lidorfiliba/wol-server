@@ -364,7 +364,17 @@ function handleMessage(ws, id, msg) {
         let bonus = 1;
         if(p.partyId && parties.has(p.partyId)){
           const party = parties.get(p.partyId);
-          const inWorld = [...party.members].filter(mid=>{ const mp=players.get(mid); return mp && mp.world===p.world; });
+          // A party member only shares the XP if they are: in the SAME world, within
+          // 20 levels of the killer, AND physically near the kill (so you can't park a
+          // low/idle alt across the map and leech). The killer always qualifies.
+          const SHARE_RANGE = 1400;
+          const inWorld = [...party.members].filter(mid=>{
+            const mp=players.get(mid); if(!mp || mp.world!==p.world) return false;
+            if(mid===id) return true;
+            if(Math.abs((mp.level||1)-(p.level||1)) > 20) return false;
+            if(Math.hypot((mp.x||0)-(m.x||0),(mp.y||0)-(m.y||0)) > SHARE_RANGE) return false;
+            return true;
+          });
           if(inWorld.length>0) recipients = inWorld;
           // party-size XP bonus: 2→1.15, 3→1.3, 4+ (with distinct classes) →1.5
           const sz = inWorld.length;
@@ -445,6 +455,16 @@ function handleMessage(ws, id, msg) {
       const text = sanitizeText(msg.text);
       if (!text.trim()) break;
       broadcast('chat', { from: p.name, level: p.level, text, fromId: id });
+      break;
+    }
+    case 'whisper': {
+      const p = players.get(id); if(!p) break;
+      if(!rateOk(p, 'chat')) break;
+      const text = sanitizeText(msg.text); if(!text.trim()) break;
+      const target = players.get(msg.targetId); if(!target) break;
+      // deliver to recipient and echo to sender so both see the thread
+      send(target.ws, 'whisper', { fromId:id, fromName:p.name, text, mine:false });
+      send(p.ws,      'whisper', { fromId:msg.targetId, fromName:target.name, text, mine:true });
       break;
     }
 
@@ -528,6 +548,22 @@ function handleMessage(ws, id, msg) {
     }
     case 'partyLeave': {
       leaveParty(id);
+      break;
+    }
+    // ── HEALER PALADIN: relay a heal pulse to nearby party members ──
+    case 'partyHeal': {
+      const p = players.get(id);
+      if(!p || !p.partyId || !parties.has(p.partyId)) break;
+      const amt = Math.max(0, Math.min(99999, msg.amount|0));
+      if(amt<=0) break;
+      const party = parties.get(p.partyId);
+      for(const mid of party.members){
+        if(mid===id) continue;
+        const mp = players.get(mid);
+        if(mp && mp.world===p.world && Math.hypot((mp.x||0)-(p.x||0),(mp.y||0)-(p.y||0)) < 600){
+          send(mp.ws, 'partyHealed', { amount: amt, from: p.name });
+        }
+      }
       break;
     }
     // ── PLAYER TRADE (relayed; the swap itself is confirmed on both clients) ──
