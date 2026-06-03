@@ -85,13 +85,27 @@ function applyXp(cs, amount){
 async function loadCharState(account, slot, fallback){
   const key = charKey(account, slot);
   if(charState.has(key)) return charState.get(key);
+  // SECURITY: gold/xp/level are SERVER-AUTHORITATIVE. We never trust client-claimed
+  // values — a new character always starts clean (gold 0, level 1). Only the DB
+  // (written by the server itself) can restore a character's real economy.
   let cs = { account, slot:slot|0, gold:0, xp:0, level:1, dirty:false, lastSave:0 };
-  // try DB
   if(SB_ON && account){
     const rows = await sbSelect(`wol_charstate?account=eq.${encodeURIComponent(account)}&slot=eq.${slot|0}&select=gold,xp,level`);
     if(rows && rows.length){ cs.gold = +rows[0].gold||0; cs.xp = +rows[0].xp||0; cs.level = +rows[0].level||1; }
-    else if(fallback){ cs.gold = fallback.gold||0; cs.level = fallback.level||1; cs.dirty = true; } // first migration
-  } else if(fallback){ cs.gold = fallback.gold||0; cs.level = fallback.level||1; }
+    else if(fallback){
+      // First-ever load with no DB row: allow a ONE-TIME migration of an existing
+      // character's progress, but CAP the seed to plausible values so a cheater can't
+      // claim a billion gold on a fresh account+slot. Real players are well under these.
+      cs.gold  = Math.max(0, Math.min(5000000, fallback.gold|0));
+      cs.level = Math.max(1, Math.min(250, fallback.level|0 || 1));
+      cs.dirty = true;
+    }
+  } else if(fallback){
+    // No database configured (memory-only mode): same capped seed so a cheater can't
+    // claim absurd values, and progress survives within the session.
+    cs.gold  = Math.max(0, Math.min(5000000, fallback.gold|0));
+    cs.level = Math.max(1, Math.min(250, fallback.level|0 || 1));
+  }
   charState.set(key, cs);
   return cs;
 }
@@ -344,11 +358,12 @@ function handleMessage(ws, id, msg) {
       const st = worldState(p.world);
       const m = st.monsters.get(msg.mid);
       if(!m || m.hp<=0) break;
-      // CAP damage to a plausible value for this player's level (anti one-shot cheat)
-      const dmg = Math.max(0, Math.min(maxPlausibleHit(p.level), msg.damage|0));
-      // Only flag truly absurd values (×8 over the already-generous ceiling) so that
-      // legitimate big hits (ultimate+crit+combo) are clamped silently, never kicked.
-      if((msg.damage|0) > maxPlausibleHit(p.level)*8) flag(p,'dmg:monster');
+      // CAP damage to a plausible value for this player's level (anti one-shot cheat).
+      // Use the AUTHORITATIVE level (_cs.level from real kills) when available so a
+      // forged 'stats' level can't raise the damage ceiling.
+      const authLevel = (p._cs && p._cs.level) ? p._cs.level : p.level;
+      const dmg = Math.max(0, Math.min(maxPlausibleHit(authLevel), msg.damage|0));
+      if((msg.damage|0) > maxPlausibleHit(authLevel)*8) flag(p,'dmg:monster');
       m.hp -= dmg;
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
@@ -592,8 +607,12 @@ function handleMessage(ws, id, msg) {
     case 'tradeOffer': {
       const p = players.get(id); if(!p || !p._tradeWith) break;
       const other = players.get(p._tradeWith); if(!other) break;
+      // SECURITY: clamp the offered gold to what the server says this player ACTUALLY
+      // has (authoritative _cs.gold). You can't offer gold you don't own.
+      const myGold = p._cs ? Math.floor(p._cs.gold) : 0;
+      const offerGold = Math.max(0, Math.min(myGold, msg.gold|0));
       // updating an offer resets BOTH confirmations (anti-switch scam)
-      p._tradeOffer = { items: Array.isArray(msg.items)?msg.items.slice(0,12):[], gold: Math.max(0, msg.gold|0), confirm:false };
+      p._tradeOffer = { items: Array.isArray(msg.items)?msg.items.slice(0,12):[], gold: offerGold, confirm:false };
       if(other._tradeOffer) other._tradeOffer.confirm = false;
       send(p.ws,    'tradeUpdate', { mine: p._tradeOffer, theirs: other._tradeOffer||{items:[],gold:0,confirm:false} });
       send(other.ws,'tradeUpdate', { mine: other._tradeOffer||{items:[],gold:0,confirm:false}, theirs: p._tradeOffer });
@@ -603,10 +622,19 @@ function handleMessage(ws, id, msg) {
       const p = players.get(id); if(!p || !p._tradeWith) break;
       const other = players.get(p._tradeWith); if(!other) break;
       if(p._tradeOffer) p._tradeOffer.confirm = true;
-      // when BOTH confirmed → execute: tell each client what it RECEIVES and GIVES
+      // when BOTH confirmed → execute
       if(p._tradeOffer && other._tradeOffer && p._tradeOffer.confirm && other._tradeOffer.confirm){
-        send(p.ws,    'tradeComplete', { give: p._tradeOffer, receive: other._tradeOffer });
-        send(other.ws,'tradeComplete', { give: other._tradeOffer, receive: p._tradeOffer });
+        // SECURITY: re-validate both gold offers against authoritative balances, then
+        // move the gold SERVER-SIDE so the economy can't be duped client-side.
+        const pGold = Math.max(0, Math.min(p._cs?Math.floor(p._cs.gold):0,    p._tradeOffer.gold|0));
+        const oGold = Math.max(0, Math.min(other._cs?Math.floor(other._cs.gold):0, other._tradeOffer.gold|0));
+        if(p._cs){ p._cs.gold = p._cs.gold - pGold + oGold; p._cs.dirty=true; }
+        if(other._cs){ other._cs.gold = other._cs.gold - oGold + pGold; other._cs.dirty=true; }
+        p._tradeOffer.gold = pGold; other._tradeOffer.gold = oGold;
+        // items are still applied client-side (client owns inventory), but gold is now
+        // authoritative — send each side the corrected balances.
+        send(p.ws,    'tradeComplete', { give: p._tradeOffer, receive: other._tradeOffer, newGold: p._cs?Math.round(p._cs.gold):undefined });
+        send(other.ws,'tradeComplete', { give: other._tradeOffer, receive: p._tradeOffer, newGold: other._cs?Math.round(other._cs.gold):undefined });
         p._tradeWith=null; p._tradeOffer=null; other._tradeWith=null; other._tradeOffer=null;
       } else {
         send(p.ws,    'tradeUpdate', { mine: p._tradeOffer, theirs: other._tradeOffer||{items:[],gold:0,confirm:false} });
