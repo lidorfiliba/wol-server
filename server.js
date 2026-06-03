@@ -277,7 +277,7 @@ function handleMessage(ws, id, msg) {
       // Tell others in the world that a new player joined
       broadcastWorld(p.world, 'playerJoined', { player: pub(p) }, id);
       // ── Shared monsters: set the world tier and send the current monster list ──
-      if(!NON_SHARED.has(p.world)){
+      if(!isNonShared(p.world)){
         const st = worldState(p.world);
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
@@ -314,7 +314,7 @@ function handleMessage(ws, id, msg) {
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
       broadcastWorld(p.world, 'playerJoined', { player: pub(p) }, id);
       // shared monsters for the new world
-      if(!NON_SHARED.has(p.world)){
+      if(!isNonShared(p.world)){
         const st = worldState(p.world);
         if(msg.worldTier) st.tier = msg.worldTier;
         if(msg.worldW && msg.worldW!==st.ww){ st.ww = msg.worldW; st.cages = null; st._cagesSent=false; }
@@ -336,7 +336,7 @@ function handleMessage(ws, id, msg) {
     case 'monsterHit': {
       // a player damaged a shared monster: { mid, damage }
       const p = players.get(id); if (!p) break;
-      if(NON_SHARED.has(p.world)) break;
+      if(isNonShared(p.world)) break;
       if(!rateOk(p, 'monsterHit')) break;
       const st = worldState(p.world);
       const m = st.monsters.get(msg.mid);
@@ -396,7 +396,7 @@ function handleMessage(ws, id, msg) {
 
     case 'monsterMove': {
       // lightweight: a client (the "host" nearest) nudges a monster's position
-      const p = players.get(id); if (!p || NON_SHARED.has(p.world)) break;
+      const p = players.get(id); if (!p || isNonShared(p.world)) break;
       const st = worldState(p.world);
       const m = st.monsters.get(msg.mid);
       if(m){ m.x = msg.x; m.y = msg.y; }
@@ -584,6 +584,12 @@ const sharedWorlds = new Map(); // world -> { monsters:Map<mid,{...}>, lastSpawn
 let nextMid = 1;
 // worlds that are NOT shared (handled fully client-side)
 const NON_SHARED = new Set(['town','arena','forge_dungeon','nest_goblin','nest_shadow','nest_titan']);
+// A world id may carry an instance tag for private nests ("nest_goblin#party:42").
+// Strip it to test the base id. All nests are non-shared (server doesn't spawn
+// their monsters — they're fully client-instanced), but peer routing still uses
+// the FULL instanced id so each party/solo player only sees their own instance.
+function baseWorld(w){ const i=(w||'').indexOf('#'); return i<0 ? w : w.slice(0,i); }
+function isNonShared(w){ return NON_SHARED.has(baseWorld(w)); }
 
 function worldState(world){
   if(!sharedWorlds.has(world)) sharedWorlds.set(world, { monsters:new Map(), tier:1, ww:9000, wh:9000 });
@@ -653,7 +659,7 @@ const MONSTER_PER_PLAYER = 8;
 const MONSTER_CAP_MAX = 110;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
-    if(NON_SHARED.has(world)) continue;
+    if(isNonShared(world)) continue;
     const pc = playersInWorld(world);
     if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
     ensureCages(st);
@@ -694,7 +700,7 @@ setInterval(()=>{
 // server just keeps authoritative HP + presence and resyncs positions occasionally).
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
-    if(NON_SHARED.has(world) || st.monsters.size===0) continue;
+    if(isNonShared(world) || st.monsters.size===0) continue;
     if(playersInWorld(world)===0) continue;
     const snap = [...st.monsters.values()].map(m=>({mid:m.mid,x:Math.round(m.x),y:Math.round(m.y),hp:m.hp}));
     broadcastWorld(world, 'monstersSync', { monsters: snap });
@@ -712,7 +718,7 @@ const BOSS_NAMES = ['גולגולת התהום','לויתן הצללים','מל�
 
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
-    if(NON_SHARED.has(world)) continue;
+    if(isNonShared(world)) continue;
     const pc = playersInWorld(world);
     const existing = worldBosses.get(world);
     // clear boss if world emptied
