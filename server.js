@@ -576,7 +576,7 @@ const WORLD_W = 9000, WORLD_H = 9000;
 const sharedWorlds = new Map(); // world -> { monsters:Map<mid,{...}>, lastSpawn }
 let nextMid = 1;
 // worlds that are NOT shared (handled fully client-side)
-const NON_SHARED = new Set(['town','arena','forge_dungeon']);
+const NON_SHARED = new Set(['town','arena','forge_dungeon','nest_goblin','nest_shadow','nest_titan']);
 
 function worldState(world){
   if(!sharedWorlds.has(world)) sharedWorlds.set(world, { monsters:new Map(), tier:1, ww:9000, wh:9000 });
@@ -591,10 +591,9 @@ function spawnMonsterFor(world, tier){
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
   const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
-  // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds, so
-  //    monsters never appear outside the walkable map. Cages are far apart so the
-  //    player meets one cluster at a time; a few wander as loners. ──
+  // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds. ──
   const margin = 600;
+  const CAGE_R = 280; // pack radius inside a pen
   if(!st.cages){
     st.cages=[];
     const minSep = Math.min(1800, Math.max(700, Math.min(ww,wh)/4));
@@ -606,34 +605,42 @@ function spawnMonsterFor(world, tier){
       st.cages.push({x:cx,y:cy});
     }
   }
-  let x,y;
-  if(st.cages.length && Math.random()<0.8){
-    const c=st.cages[Math.floor(Math.random()*st.cages.length)];
-    const a=Math.random()*Math.PI*2, r=Math.random()*300;
+  let x,y, cageIdx=-1;
+  if(st.cages.length && Math.random()<0.85){
+    // count current population per cage, then fill the EMPTIEST one (so a cage
+    // the player just cleared gets repopulated instead of random scattering).
+    const counts = new Array(st.cages.length).fill(0);
+    for(const mm of st.monsters.values()){
+      if(mm.cage>=0 && mm.cage<counts.length) counts[mm.cage]++;
+    }
+    let best=0; for(let i=1;i<counts.length;i++){ if(counts[i]<counts[best]) best=i; }
+    cageIdx=best;
+    const c=st.cages[best];
+    const a=Math.random()*Math.PI*2, r=Math.random()*CAGE_R;
     x=Math.max(150,Math.min(ww-150, c.x+Math.cos(a)*r));
     y=Math.max(150,Math.min(wh-150, c.y+Math.sin(a)*r));
   } else {
     x=margin/2+Math.random()*(ww-margin); y=margin/2+Math.random()*(wh-margin);
   }
-  const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0 };
+  const m = { mid, x, y, hp: maxHp, maxHp, level: lvl, tier, kind: Math.floor(Math.random()*4), vx:0, vy:0, cage:cageIdx };
   st.monsters.set(mid, m);
   return m;
 }
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
 // Many more monsters now, and more when extra players are around.
-const MONSTER_BASE = 48;     // baseline monsters per active shared world (denser cages)
-const MONSTER_PER_PLAYER = 8;
-const MONSTER_CAP_MAX = 108;
+const MONSTER_BASE = 132;    // baseline so even a solo player gets dense cages
+const MONSTER_PER_PLAYER = 12;
+const MONSTER_CAP_MAX = 180;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
     const pc = playersInWorld(world);
     if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
     const cap = Math.min(MONSTER_CAP_MAX, MONSTER_BASE + pc*MONSTER_PER_PLAYER);
-    // spawn gradually (up to 8 per tick) so they trickle in naturally
+    // respawn quickly so cleared cages refill (up to 16 per tick)
     let spawned=[];
-    let budget = 8;
+    let budget = 16;
     while(st.monsters.size < cap && budget-- > 0){
       spawned.push(spawnMonsterFor(world, st.tier||1));
     }
