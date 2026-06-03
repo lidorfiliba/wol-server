@@ -347,8 +347,10 @@ function handleMessage(ws, id, msg) {
       m.hp -= dmg;
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
-        // base XP for this monster (server-authoritative, scales with level)
-        const baseXp = Math.round(20 + (m.level||1)*12);
+        st.lastDeath = Date.now();   // arm the 10s respawn cooldown
+        // base XP — matches the client formula (8 + lv^1.5 * 0.55) so progression
+        // is identical online and offline.
+        const baseXp = Math.max(4, Math.round(8 + Math.pow(m.level||1, 1.5)*0.55));
         // who shares the XP? the killer's party members in the SAME world, else just the killer.
         let recipients = [id];
         let bonus = 1;
@@ -607,7 +609,9 @@ function spawnMonsterFor(world, tier){
   const mid = 'm'+(nextMid++);
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
-  const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 1.35);
+  // tougher monsters: ~2.2x HP so they take several hits (not 2). Matches the
+  // client-side bump in makeMonster so shared HP stays consistent.
+  const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * 2.2);
   // ── Spawn in FIXED, SPREAD-OUT cage clusters within THIS world's bounds. ──
   const CAGE_R = 280; // pack radius inside a pen
   const margin = 600;
@@ -636,24 +640,31 @@ function spawnMonsterFor(world, tier){
 
 // Spawn + broadcast loop: keep each populated shared world stocked.
 // Many more monsters now, and more when extra players are around.
-const MONSTER_BASE = 132;    // baseline so even a solo player gets dense cages
-const MONSTER_PER_PLAYER = 12;
-const MONSTER_CAP_MAX = 180;
+// Fewer, tougher monsters: ~12 per cage (was ~22) so fights are about skill,
+// not crowd-clearing. Higher HP is applied in spawnMonsterFor (×2.2).
+const MONSTER_BASE = 72;     // ~12 per cage across 6 cages
+const MONSTER_PER_PLAYER = 8;
+const MONSTER_CAP_MAX = 110;
 setInterval(()=>{
   for(const [world, st] of sharedWorlds){
     if(NON_SHARED.has(world)) continue;
     const pc = playersInWorld(world);
     if(pc===0){ st.monsters.clear(); continue; } // no players → clear to save memory
     const cap = Math.min(MONSTER_CAP_MAX, MONSTER_BASE + pc*MONSTER_PER_PLAYER);
-    // respawn quickly so cleared cages refill (up to 16 per tick)
+    // ── RESPAWN DELAY: after a kill, wait ~10s before refilling. This gives a
+    //    real lull (cleared cages stay clear for a bit) instead of instant refill. ──
+    if(st.monsters.size >= cap) continue;             // already full
+    const sinceDeath = Date.now() - (st.lastDeath||0);
+    if(st.lastDeath && sinceDeath < 10000) continue;  // still in the 10s cooldown
+    // refill (a burst once the cooldown passes), then arm the next cooldown
     let spawned=[];
     let budget = 16;
     while(st.monsters.size < cap && budget-- > 0){
       spawned.push(spawnMonsterFor(world, st.tier||1));
     }
     if(spawned.length){
+      st.lastDeath = 0; // refilled — clear the cooldown marker
       broadcastWorld(world, 'monstersSpawn', { monsters: spawned.map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})) });
-      // send cage positions so clients can draw the fenced pens
       if(st.cages && !st._cagesSent){ st._cagesSent=true; broadcastWorld(world, 'cages', { cages: st.cages }); }
     }
   }
