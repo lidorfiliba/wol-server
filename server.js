@@ -803,7 +803,9 @@ function spawnMonsterForCage(world, tier, cageIdx){
   const mid = 'm'+(nextMid++);
   const lvl = Math.max(1, Math.round(tier*tier*0.9 + tier*6) + Math.floor(Math.random()*12));
   const variety = 0.85 + Math.random()*0.5;
-  const hpMul = Math.min(2.2, 0.85 + lvl*0.055); // ramps: easy early game, full by ~lv25
+  const baseMul = Math.min(2.2, 0.85 + lvl*0.055);
+  const lateMul = 1 + Math.max(0, lvl-30) * 0.012; // matches client late-game ramp
+  const hpMul = baseMul * lateMul;
   const maxHp = Math.round((35 + lvl*lvl*0.5 + lvl*16) * variety * hpMul); // matches client
   const CAGE_R = 280;
   ensureCages(st);
