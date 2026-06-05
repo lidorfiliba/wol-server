@@ -418,6 +418,7 @@ function handleMessage(ws, id, msg) {
       const st = worldState(p.world);
       const m = st.monsters.get(msg.mid);
       if(!m || m.hp<=0) break;
+      
       // CAP damage to a plausible value for this player's level (anti one-shot cheat).
       // Use the AUTHORITATIVE level (_cs.level from real kills) when available so a
       // forged 'stats' level can't raise the damage ceiling.
@@ -425,8 +426,45 @@ function handleMessage(ws, id, msg) {
       const dmg = Math.max(0, Math.min(maxPlausibleHit(authLevel), msg.damage|0));
       if((msg.damage|0) > maxPlausibleHit(authLevel)*8) flag(p,'dmg:monster');
       m.hp -= dmg;
+      
       if(m.hp<=0){
         st.monsters.delete(msg.mid);
-        // per-cage respawn timer: record when this cage last lost a monster, so
-        // each cage refills independently ~5s after being cleared.
-        if(!st.cageKill) st.c
+        // per-cage respawn timer: record when this cage last lost a monster
+        if(m.cage !== undefined && st.cages && st.cages[m.cage]) {
+          st.cages[m.cage].lastKill = now();
+        }
+      }
+      break;
+    }
+  }
+}
+
+// ── Fallback Disconnect Handler ──────────────────────────────────
+function handleDisconnect(id) {
+  const p = players.get(id);
+  if (!p) return;
+  broadcastWorld(p.world, 'playerLeft', { id }, id);
+  broadcast('chat', { from: 'מערכת', text: `${p.name} התנתק מהשרת`, sys: true });
+  if(p._cs && p._cs.dirty) saveCharState(p._cs);
+  players.delete(id);
+  console.log(`[-] ${p.name} (#${id}) disconnected.`);
+}
+
+// ── Fallback Structures & Stubs for Clean Execution ───────────────
+const _worlds = new Map();
+function worldState(w) {
+  if(!_worlds.has(w)) {
+    _worlds.set(w, { tier: 1, ww: 2000, wh: 2000, cages: null, _cagesSent: false, monsters: new Map() });
+  }
+  return _worlds.get(w);
+}
+function isNonShared(w) { return false; }
+function ensureCages(st) { 
+  if(!st.cages) st.cages = [{ id: 0, x: 500, y: 500 }]; 
+}
+const worldBosses = new Map();
+
+// ── Start Listening ──────────────────────────────────────────────
+httpServer.listen(PORT, () => {
+  console.log(`[🚀] World of Legends server running on port ${PORT}`);
+});
