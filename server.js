@@ -215,7 +215,7 @@ function isReservedServerName(name){
 
 // ── Helpers ───────────────────────────────────────────────────────
 function send(ws, type, data) {
-  if (ws.readyState === ws.OPEN) {
+  if (ws && ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify({ type, ...data }));
   }
 }
@@ -223,7 +223,7 @@ function broadcast(type, data, exceptId = null) {
   const msg = JSON.stringify({ type, ...data });
   for (const p of players.values()) {
     if (p.id === exceptId) continue;
-    if (p.ws.readyState === p.ws.OPEN) p.ws.send(msg);
+    if (p.ws && p.ws.readyState === p.ws.OPEN) p.ws.send(msg);
   }
 }
 // Broadcast only to players in the same world (so you see who's near you)
@@ -232,7 +232,7 @@ function broadcastWorld(world, type, data, exceptId = null) {
   for (const p of players.values()) {
     if (p.id === exceptId) continue;
     if (p.world !== world) continue;
-    if (p.ws.readyState === p.ws.OPEN) p.ws.send(msg);
+    if (p.ws && p.ws.readyState === p.ws.OPEN) p.ws.send(msg);
   }
 }
 // Public snapshot of a player (no ws handle)
@@ -307,6 +307,16 @@ function handleMessage(ws, id, msg) {
         send(ws, 'kicked', { reason: 'שם זה שמור ואינו זמין' });
         try{ ws.close(); }catch(e){}
         break;
+      }
+      // reclaim: if this same account+slot has a lingering ghost from a prior session,
+      // remove it so the player doesn't see a duplicate of themselves.
+      if(msg.account){
+        for(const [gid,gp] of players){
+          if(gp._ghost && gp.account===msg.account && (gp.slot|0)===(msg.slot|0)){
+            broadcastWorld(gp.world, 'playerLeft', { id: gid }, gid);
+            players.delete(gid);
+          }
+        }
       }
       const p = {
         id,
@@ -749,11 +759,32 @@ function handleDisconnect(id) {
   // cancel any in-progress trade so the partner isn't left hanging
   if(p._tradeWith){ const other=players.get(p._tradeWith); if(other){ other._tradeWith=null; other._tradeOffer=null; send(other.ws,'tradeCancelled',{byId:id}); } }
   leaveParty(id);
+  // ANTI-EXPLOIT: instead of vanishing instantly, the character LINGERS at its last
+  // position as a vulnerable "ghost" so a player can't disconnect to dodge death or to
+  // park in a forbidden spot. It's removed once killed or after a short grace period.
+  // (Skip lingering in non-shared/instanced worlds, where it has no multiplayer effect.)
+  if(p.world && !isNonShared(p.world) && !p._ghost){
+    p._ghost = true; p._ghostUntil = Date.now() + 60000; // up to 60s
+    p.ws = null; // no socket anymore
+    broadcastWorld(p.world, 'peerGhost', { id }, id); // tell others it's now an AFK ghost
+    console.log(`[~] ${p.name} (#${id}) disconnected → lingering ghost. Online: ${players.size-1}`);
+    return; // keep the entity in `players` for now
+  }
   broadcastWorld(p.world, 'playerLeft', { id }, id);
   broadcast('chat', { from: 'מערכת', text: `${p.name} התנתק`, sys: true });
   players.delete(id);
   console.log(`[-] ${p.name} (#${id}) left. Online: ${players.size}`);
 }
+// Remove lingering ghosts once their grace period expires.
+setInterval(()=>{
+  const now=Date.now();
+  for(const [id,p] of players){
+    if(p._ghost && (now > p._ghostUntil)){
+      broadcastWorld(p.world, 'playerLeft', { id }, id);
+      players.delete(id);
+    }
+  }
+}, 5000);
 
 // ════════════════════════════════════════════════════════════════
 //  SHARED MONSTERS — the server owns monsters per world so every
@@ -943,6 +974,7 @@ setInterval(()=>{
 const heartbeat = setInterval(() => {
   for (const p of players.values()) {
     const ws = p.ws;
+    if (!ws) continue; // lingering ghost (no socket) — handled by its own timeout
     if (ws.isAlive === false) { ws.terminate(); handleDisconnect(p.id); continue; }
     ws.isAlive = false;
     try { ws.ping(); } catch {}
