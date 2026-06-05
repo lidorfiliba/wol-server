@@ -646,6 +646,24 @@ function handleMessage(ws, id, msg) {
       }
       break;
     }
+    case 'partyBuff': {
+      const p = players.get(id);
+      if(!p || !rateOk(p,'social')) break;
+      if(!p.partyId || !parties.has(p.partyId)) break;
+      // sanitize the buff before relaying (clamp values so no client can inject huge buffs)
+      const buffKey = ['atk','matk','crit','def'].includes(msg.buffKey) ? msg.buffKey : 'atk';
+      const buffVal = Math.max(0, Math.min(0.3, +msg.buffVal||0));
+      const dur = Math.max(0, Math.min(300000, msg.dur|0));
+      const party = parties.get(p.partyId);
+      for(const mid of party.members){
+        if(mid===id) continue;
+        const mp = players.get(mid);
+        if(mp && mp.world===p.world){
+          send(mp.ws, 'partyBuff', { skillId: String(msg.skillId||'buff').slice(0,32), buffKey, buffVal, dur, name: String(msg.name||'באף').slice(0,40), emoji: String(msg.emoji||'✨').slice(0,4) });
+        }
+      }
+      break;
+    }
     // ── PLAYER TRADE (relayed; the swap itself is confirmed on both clients) ──
     case 'tradeRequest': {
       const p = players.get(id), target = players.get(msg.targetId);
@@ -950,8 +968,9 @@ setInterval(()=>{
       const last = st._lastBoss||0;
       if(Date.now()-last > 3600000){ // ONE boss per hour per world
         const tier = st.tier||1;
-        // HP scales with players; solo is beatable with skills/combo, groups face a tankier boss
-        const maxHp = Math.round((6000 + tier*tier*3000) * Math.max(1, pc*0.8));
+        // World boss = a shared challenge EVENT (one per hour). Much tankier than a field
+        // boss so a group fights it for several minutes; scales with player count.
+        const maxHp = Math.round((22000 + tier*tier*9000) * Math.max(1, pc*0.85));
         const ww = st.ww||9000, wh = st.wh||9000;
         const boss = { bid:'B'+(nextBid++), hp:maxHp, maxHp, level:5+tier*10,
           x: ww*0.5, y: wh*0.5, name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
