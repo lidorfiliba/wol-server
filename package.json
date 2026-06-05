@@ -8,7 +8,7 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": "22.x"
+    "node": "18.x"
   },
   "dependencies": {
     "ws": "^8.18.0"
