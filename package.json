@@ -1,16 +1,12 @@
 {
-  "name": "wol-multiplayer-server",
+  "name": "wol-server",
   "version": "1.0.0",
-  "description": "World of Legends — real-time multiplayer server (shared world, chat, PvP)",
-  "type": "module",
+  "description": "World of Legends multiplayer server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": "22.x"
-  },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.16.0"
   }
 }

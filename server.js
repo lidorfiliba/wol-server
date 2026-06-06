@@ -55,14 +55,26 @@ let nextPartyId = 1;
 //    g = { name, key, leader(account), members:Map<account,{name,level}>, chat:[{from,text,t}] }
 // ════════════════════════════════════════════════════════════════
 const guilds = new Map();          // key(lowercase name) -> guild
-const accountGuild = new Map();    // account -> guild key
+const accountGuild = new Map();    // charKey -> guild key  (membership is PER-CHARACTER)
 function guildKey(name){ return String(name||'').trim().toLowerCase(); }
+// guild membership is keyed PER CHARACTER (account+slot), so different characters
+// on the same account can each be in their own guild.
+function pcKey(p){ return (p.account||'') + ':' + (p.slot|0); }
 function guildPub(g){
   if(!g) return null;
   const members = [];
   for(const [acc,info] of g.members){ members.push({ name:info.name, level:info.level||1, leader: acc===g.leader }); }
   members.sort((a,b)=>(b.leader?1:0)-(a.leader?1:0) || (b.level||0)-(a.level||0));
   return { name:g.name, members, chat:(g.chat||[]).slice(-30) };
+}
+// ── PvP DEATHMATCH: live kill-count scoreboard for the arena (a scored mode) ──
+function broadcastArenaBoard(){
+  const board=[];
+  for(const pl of players.values()){
+    if(pl.world==='arena' && !pl._ghost){ board.push({ name: pl.name, kills: pl._arenaKills||0, level: pl.level||1 }); }
+  }
+  board.sort((a,b)=>(b.kills-a.kills)||(b.level-a.level));
+  broadcastWorld('arena', 'arenaBoard', { board: board.slice(0,8) });
 }
 function guildListPub(){
   const list = [];
@@ -75,7 +87,7 @@ function pushGuildInfo(g){
   if(!g) return;
   const info = guildPub(g);
   for(const p of players.values()){
-    if(p.account && g.members.has(p.account) && p.ws && p.ws.readyState===p.ws.OPEN){
+    if(p.account && g.members.has(pcKey(p)) && p.ws && p.ws.readyState===p.ws.OPEN){
       send(p.ws, 'guildInfo', { guild: info });
     }
   }
@@ -83,7 +95,7 @@ function pushGuildInfo(g){
 function broadcastGuildChat(g, from, text){
   if(!g) return;
   for(const p of players.values()){
-    if(p.account && g.members.has(p.account) && p.ws && p.ws.readyState===p.ws.OPEN){
+    if(p.account && g.members.has(pcKey(p)) && p.ws && p.ws.readyState===p.ws.OPEN){
       send(p.ws, 'guildChat', { from, text });
     }
   }
@@ -378,6 +390,20 @@ function handleMessage(ws, id, msg) {
         try{ ws.close(); }catch(e){}
         break;
       }
+      // ── ONLINE NAME UNIQUENESS: block if a DIFFERENT account already plays this name ──
+      {
+        const nameKey = safeName.trim().toLowerCase();
+        let clash = false;
+        for(const [, gp] of players){
+          if(gp.account && msg.account && gp.account===msg.account) continue; // same account (other slot) is fine
+          if(!gp._ghost && (gp.name||'').trim().toLowerCase()===nameKey){ clash = true; break; }
+        }
+        if(clash){
+          send(ws, 'kicked', { reason: 'השם כבר בשימוש על ידי שחקן אחר' });
+          try{ ws.close(); }catch(e){}
+          break;
+        }
+      }
       // reclaim: if this same account+slot has a lingering ghost from a prior session,
       // remove it so the player doesn't see a duplicate of themselves.
       if(msg.account){
@@ -409,16 +435,19 @@ function handleMessage(ws, id, msg) {
       p.account = (msg.account || '').slice(0,40);
       p.slot = msg.slot|0;
       p.isGM = false;
-      // ── GUILD: re-link this account to its guild (membership persists) and
-      //    keep the member's display name/level fresh. ──
-      if(p.account && accountGuild.has(p.account)){
-        const g = guilds.get(accountGuild.get(p.account));
-        if(g){
-          p.guild = g.name;
-          g.members.set(p.account, { name: p.name, level: p.level });
-          send(ws, 'guildInfo', { guild: guildPub(g) });
-          pushGuildInfo(g); // refresh others' member levels
-        } else { accountGuild.delete(p.account); }
+      // ── GUILD: re-link THIS CHARACTER to its guild (membership is per-character
+      //    and persists), and keep the member's display name/level fresh. ──
+      if(p.account){
+        const ck = pcKey(p);
+        if(accountGuild.has(ck)){
+          const g = guilds.get(accountGuild.get(ck));
+          if(g){
+            p.guild = g.name;
+            g.members.set(ck, { name: p.name, level: p.level });
+            send(ws, 'guildInfo', { guild: guildPub(g) });
+            pushGuildInfo(g); // refresh others' member levels
+          } else { accountGuild.delete(ck); }
+        }
       }
       if(p.account){
         loadCharState(p.account, p.slot, { gold: msg.gold|0, level: p.level }).then(cs=>{
@@ -477,8 +506,10 @@ function handleMessage(ws, id, msg) {
       if(p._tradeWith){ const o=players.get(p._tradeWith); if(o){ o._tradeWith=null; o._tradeOffer=null; send(o.ws,'tradeCancelled',{byId:id}); } p._tradeWith=null; p._tradeOffer=null; }
       p.world = msg.world;
       p.x = msg.x || 0; p.y = msg.y || 0;
+      if(p.world==='arena') p._arenaKills = 0; // fresh deathmatch score on entry
       send(ws, 'peers', { peers: worldPeers(p.world, id) });
       broadcastWorld(p.world, 'playerJoined', { player: pub(p) }, id);
+      if(oldWorld==='arena' || p.world==='arena') broadcastArenaBoard();
       // shared monsters for the new world
       if(!isNonShared(p.world)){
         const st = worldState(p.world);
@@ -684,7 +715,9 @@ function handleMessage(ws, id, msg) {
       if (killer) {
         send(killer.ws, 'pvpKill', { victimId: id, victimName: p.name });
         broadcast('chat', { from: 'מערכת', text: `⚔️ ${killer.name} חיסל את ${p.name}!`, sys: true });
+        if(killer.world==='arena'){ killer._arenaKills = (killer._arenaKills||0)+1; }
       }
+      if(p.world==='arena' || (killer&&killer.world==='arena')) broadcastArenaBoard();
       break;
     }
 
@@ -770,11 +803,25 @@ function handleMessage(ws, id, msg) {
       const buffVal = Math.max(0, Math.min(0.3, +msg.buffVal||0));
       const dur = Math.max(0, Math.min(300000, msg.dur|0));
       const party = parties.get(p.partyId);
+      // reaches EVERY party member regardless of which world they're in (persists across maps)
       for(const mid of party.members){
         if(mid===id) continue;
         const mp = players.get(mid);
-        if(mp && mp.world===p.world){
+        if(mp && mp.ws && mp.ws.readyState===mp.ws.OPEN){
           send(mp.ws, 'partyBuff', { skillId: String(msg.skillId||'buff').slice(0,32), buffKey, buffVal, dur, name: String(msg.name||'באף').slice(0,40), emoji: String(msg.emoji||'✨').slice(0,4) });
+        }
+      }
+      break;
+    }
+    case 'partyBuffEnd': {
+      const p = players.get(id);
+      if(!p || !p.partyId || !parties.has(p.partyId)) break;
+      const party = parties.get(p.partyId);
+      for(const mid of party.members){
+        if(mid===id) continue;
+        const mp = players.get(mid);
+        if(mp && mp.ws && mp.ws.readyState===mp.ws.OPEN){
+          send(mp.ws, 'partyBuffEnd', { skillId: String(msg.skillId||'').slice(0,32) });
         }
       }
       break;
@@ -867,21 +914,23 @@ function handleMessage(ws, id, msg) {
     }
     case 'guildInfo': {
       const p = players.get(id); if(!p) break;
-      const g = (p.account && accountGuild.has(p.account)) ? guilds.get(accountGuild.get(p.account)) : null;
+      const ck = pcKey(p);
+      const g = (p.account && accountGuild.has(ck)) ? guilds.get(accountGuild.get(ck)) : null;
       send(ws, 'guildInfo', { guild: g ? guildPub(g) : null });
       break;
     }
     case 'guildCreate': {
       const p = players.get(id); if(!p) break;
       if(!p.account){ send(ws, 'guildError', { reason: 'דרוש חשבון מחובר' }); break; }
-      if(accountGuild.has(p.account)){ send(ws, 'guildError', { reason: 'אתה כבר חבר בגילדה' }); break; }
+      const ck = pcKey(p);
+      if(accountGuild.has(ck)){ send(ws, 'guildError', { reason: 'הדמות הזו כבר חברה בגילדה' }); break; }
       const name = sanitizeText(String(msg.name||'')).trim().slice(0,18);
       const key = guildKey(name);
       if(key.length<2){ send(ws, 'guildError', { reason: 'שם גילדה קצר מדי' }); break; }
       if(guilds.has(key)){ send(ws, 'guildError', { reason: 'שם הגילדה כבר תפוס' }); break; }
-      const g = { name, key, leader:p.account, members:new Map(), chat:[] };
-      g.members.set(p.account, { name:p.name, level:p.level });
-      guilds.set(key, g); accountGuild.set(p.account, key);
+      const g = { name, key, leader:ck, members:new Map(), chat:[] };
+      g.members.set(ck, { name:p.name, level:p.level });
+      guilds.set(key, g); accountGuild.set(ck, key);
       p.guild = name;
       persistGuild(g);
       send(ws, 'guildJoined', { guild: guildPub(g) });
@@ -892,12 +941,13 @@ function handleMessage(ws, id, msg) {
     case 'guildJoin': {
       const p = players.get(id); if(!p) break;
       if(!p.account){ send(ws, 'guildError', { reason: 'דרוש חשבון מחובר' }); break; }
-      if(accountGuild.has(p.account)){ send(ws, 'guildError', { reason: 'אתה כבר חבר בגילדה' }); break; }
+      const ck = pcKey(p);
+      if(accountGuild.has(ck)){ send(ws, 'guildError', { reason: 'הדמות הזו כבר חברה בגילדה' }); break; }
       const g = guilds.get(guildKey(msg.name));
       if(!g){ send(ws, 'guildError', { reason: 'הגילדה לא נמצאה' }); break; }
       if(g.members.size>=60){ send(ws, 'guildError', { reason: 'הגילדה מלאה' }); break; }
-      g.members.set(p.account, { name:p.name, level:p.level });
-      accountGuild.set(p.account, g.key);
+      g.members.set(ck, { name:p.name, level:p.level });
+      accountGuild.set(ck, g.key);
       p.guild = g.name;
       persistGuild(g);
       send(ws, 'guildJoined', { guild: guildPub(g) });
@@ -908,12 +958,13 @@ function handleMessage(ws, id, msg) {
     }
     case 'guildLeave': {
       const p = players.get(id); if(!p || !p.account) break;
-      const key = accountGuild.get(p.account);
+      const ck = pcKey(p);
+      const key = accountGuild.get(ck);
       const g = key ? guilds.get(key) : null;
       if(g){
-        g.members.delete(p.account);
-        accountGuild.delete(p.account);
-        const wasLeader = g.leader===p.account;
+        g.members.delete(ck);
+        accountGuild.delete(ck);
+        const wasLeader = g.leader===ck;
         if(g.members.size===0){ guilds.delete(g.key); }
         else if(wasLeader){ g.leader = g.members.keys().next().value; persistGuild(g); pushGuildInfo(g); broadcastGuildChat(g, 'מערכת', `${p.name} עזב. מנהיג חדש מונה.`); }
         else { persistGuild(g); pushGuildInfo(g); broadcastGuildChat(g, 'מערכת', `${p.name} עזב את הגילדה.`); }
@@ -925,7 +976,7 @@ function handleMessage(ws, id, msg) {
     }
     case 'guildChat': {
       const p = players.get(id); if(!p || !p.account) break;
-      const key = accountGuild.get(p.account);
+      const key = accountGuild.get(pcKey(p));
       const g = key ? guilds.get(key) : null;
       if(!g){ send(ws, 'guildError', { reason: 'אינך חבר בגילדה' }); break; }
       if(!rateOk(p, 'chat')){ break; }
