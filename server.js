@@ -1175,8 +1175,13 @@ setInterval(()=>{
         // boss so a group fights it for several minutes; scales with player count.
         const maxHp = Math.round((22000 + tier*tier*9000) * Math.max(1, pc*0.85));
         const ww = st.ww||9000, wh = st.wh||9000;
+        // Spawn the boss WELL AWAY from the central spawn/outpost (players appear at
+        // ww/2,wh/2). Placing it dead-center made new players materialize inside it.
+        const ang = Math.random()*Math.PI*2;
+        const bx = ww*0.5 + Math.cos(ang)*ww*0.28;
+        const by = wh*0.5 + Math.sin(ang)*wh*0.28;
         const boss = { bid:'B'+(nextBid++), hp:maxHp, maxHp, level:5+tier*10,
-          x: ww*0.5, y: wh*0.5, name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
+          x: Math.round(bx), y: Math.round(by), name:BOSS_NAMES[Math.floor(Math.random()*BOSS_NAMES.length)],
           spawnedAt:Date.now() };
         worldBosses.set(world, boss);
         st._lastBoss = Date.now();
