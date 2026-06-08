@@ -1,8 +1,0 @@
-{
-  "name": "wol-server",
-  "version": "1.0.0",
-  "description": "World of Legends multiplayer server",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.16.0" }
-}
