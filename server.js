@@ -57,6 +57,65 @@ const parties = new Map();
 let nextPartyId = 1;
 
 // ════════════════════════════════════════════════════════════════
+//  DAILY WORLD BOSS — מופיע כל יום ב-20:00 ב-boss_arena.
+//  בוס אחד גלובלי, HP משותף לכל השחקנים, מחכה עד שמישהו יהרוג אותו.
+//  שונה ממערכת ה-worldBosses (per-world, per-hour) הקיימת.
+//  חובה להגדיר TZ=Asia/Jerusalem ב-Render → Environment.
+// ════════════════════════════════════════════════════════════════
+let dailyBoss = null;       // אובייקט הבוס הפעיל, או null
+let lastDailyBossDay = null; // 'YYYY-M-D' של היום שבו הוא הוולד
+const DAILY_BOSS_CFG = {
+  spawnHour:  20,           // 20:00 לפי TZ של השרת
+  arenaWorld: 'boss_arena', // חייב להתאים ל-world id ב-index.html
+  baseHp:     12000000,     // 12 מיליון HP
+  level:      250,
+  name:       'טיטאן העולם',
+  x: 2100, y: 2100,        // מרכז boss_arena (4200×4200)
+};
+function dailyBossDayKey(d){ return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; }
+
+// ── Helper: מציאת ה-ws לפי playerId (לצורך גמול אישי) ──
+function findSocketByPlayerId(pid){
+  for(const p of players.values()){
+    if(String(p.id)===String(pid) || p.account===pid) return p.ws;
+  }
+  return null;
+}
+
+function spawnDailyBoss(){
+  if(dailyBoss) return; // לא שני בוסים בו-זמנית
+  dailyBoss = {
+    bid:         'wb_' + Date.now(),
+    name:        DAILY_BOSS_CFG.name,
+    level:       DAILY_BOSS_CFG.level,
+    x:           DAILY_BOSS_CFG.x,
+    y:           DAILY_BOSS_CFG.y,
+    hp:          DAILY_BOSS_CFG.baseHp,
+    maxHp:       DAILY_BOSS_CFG.baseHp,
+    contributors: {},       // playerId -> סה"כ נזק שגרם
+    _lastHpBroadcast: 0,
+  };
+  lastDailyBossDay = dailyBossDayKey(new Date());
+  broadcast('worldBossSpawn', {
+    bid: dailyBoss.bid, name: dailyBoss.name, level: dailyBoss.level,
+    x: dailyBoss.x, y: dailyBoss.y, hp: dailyBoss.hp, maxHp: dailyBoss.maxHp,
+    daily: true,
+  });
+  broadcast('chat', { from:'מערכת', text:`⚠️ ${dailyBoss.name} הופיע ב-boss_arena! כולם מוזמנים לסייע!`, sys:true });
+  console.log(`👹 Daily boss spawned: ${dailyBoss.name} (${dailyBoss.maxHp} HP)`);
+}
+
+// בדיקה כל דקה: האם הגיעה השעה ועדיין לא הוולד בוס היום?
+setInterval(() => {
+  const now = new Date();
+  const today = dailyBossDayKey(now);
+  const isTime = now.getHours() === DAILY_BOSS_CFG.spawnHour && now.getMinutes() === 0;
+  if(isTime && !dailyBoss && lastDailyBossDay !== today){
+    spawnDailyBoss();
+  }
+}, 60 * 1000);
+
+// ════════════════════════════════════════════════════════════════
 //  GUILDS — persistent player communities (keyed by lowercase name).
 //  Membership is by ACCOUNT so it survives reconnects/relogs. State is
 //  in-memory and (optionally) persisted to Supabase table `wol_guilds`
@@ -487,6 +546,14 @@ function handleMessage(ws, id, msg) {
         send(ws, "monstersSpawn", { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
         const wb = worldBosses.get(p.world);
         if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
+        // Daily boss — אם פעיל, שלח לשחקן שנכנס כדי שיראה את ה-HP bar
+        if(dailyBoss){
+          send(ws, 'worldBossSpawn', {
+            bid: dailyBoss.bid, name: dailyBoss.name, level: dailyBoss.level,
+            x: dailyBoss.x, y: dailyBoss.y, hp: dailyBoss.hp, maxHp: dailyBoss.maxHp,
+            daily: true,
+          });
+        }
       }
       // System chat
       broadcast('chat', { from: 'מערכת', text: `${p.name} התחבר לעולם`, sys: true });
@@ -652,6 +719,52 @@ function handleMessage(ws, id, msg) {
         broadcast('chat', { from:'מערכת', text:`🏆 ${boss.name} הובס! ${p.name} נתן את המכה הסופית. כל העוזרים תוגמלו!`, sys:true });
       } else {
         broadcastWorld(p.world, 'worldBossHp', { bid:boss.bid, hp:boss.hp });
+      }
+      break;
+    }
+
+    // ── DAILY WORLD BOSS HIT — בוס יומי גלובלי ב-boss_arena ──
+    case 'dailyBossHit': {
+      const p = players.get(id); if(!p) break;
+      if(!rateOk(p, 'worldBossHit')) break;
+      if(!dailyBoss || !msg || msg.bid !== dailyBoss.bid) break;
+      const authLevel = (p._cs && p._cs.level) ? p._cs.level : p.level;
+      const dmg = Math.max(0, Math.min(maxPlausibleHit(authLevel), Math.round(msg.damage || 0)));
+      if((msg.damage|0) > maxPlausibleHit(authLevel)*1.5) flag(p,'dmg:dailyboss');
+      if(dmg <= 0) break;
+      dailyBoss.hp -= dmg;
+      // צבירת נזק לכל תורם (לגמול)
+      const pid = p.account || String(p.id);
+      dailyBoss.contributors[pid] = (dailyBoss.contributors[pid] || 0) + dmg;
+
+      if(dailyBoss.hp <= 0){
+        // ── הבוס היומי הובס ──
+        const byName = p.name || 'גיבור';
+        broadcast('worldBossDead', { bid: dailyBoss.bid, name: dailyBoss.name, byName, daily: true });
+        broadcast('chat', { from:'מערכת', text:`🏆 ${dailyBoss.name} הובס! ${byName} נתן את המכה הסופית!`, sys:true });
+        // גמול לכל מי שתרם נזק
+        for(const [cpid] of Object.entries(dailyBoss.contributors)){
+          const sock = findSocketByPlayerId(cpid);
+          if(sock && sock.readyState === 1){
+            const cp = [...players.values()].find(pl=>(pl.account===cpid || String(pl.id)===cpid));
+            if(cp && cp._cs){
+              cp._cs.gold += 100000;
+              const leveled = applyXp(cp._cs, 500000);
+              cp.level = cp._cs.level;
+              send(sock, 'charState', { gold: Math.round(cp._cs.gold), xp: Math.round(cp._cs.xp), level: cp._cs.level, gainXp: 500000, gainGold: 100000, leveled });
+            }
+            send(sock, 'worldBossReward', { name: dailyBoss.name, xp: 500000, gold: 100000, daily: true });
+          }
+        }
+        console.log(`🏆 Daily boss defeated by ${byName}`);
+        dailyBoss = null; // מת עד מחר — lastDailyBossDay כבר מוגדר
+      } else {
+        // throttle: שידור HP לכל 200ms כדי לא להציף
+        const t = Date.now();
+        if(t - dailyBoss._lastHpBroadcast > 200){
+          dailyBoss._lastHpBroadcast = t;
+          broadcast('worldBossHp', { bid: dailyBoss.bid, hp: Math.max(0, dailyBoss.hp), maxHp: dailyBoss.maxHp, daily: true });
+        }
       }
       break;
     }
