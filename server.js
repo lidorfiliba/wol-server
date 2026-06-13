@@ -74,6 +74,12 @@ const DAILY_BOSS_CFG = {
 };
 function dailyBossDayKey(d){ return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`; }
 
+// Pool של materials שמקס-רמה יכול לבחור (ללא treasure_map)
+const DAILY_BOSS_MATS = [
+  'ember_shard', 'frost_core', 'void_essence',
+  'titan_ore', 'forge_crystal', 'inferno_core', 'astral_shard',
+];
+
 // ── Helper: מציאת ה-ws לפי playerId (לצורך גמול אישי) ──
 function findSocketByPlayerId(pid){
   for(const p of players.values()){
@@ -546,14 +552,14 @@ function handleMessage(ws, id, msg) {
         send(ws, "monstersSpawn", { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
         const wb = worldBosses.get(p.world);
         if(wb) send(ws, 'worldBossSpawn', { bid:wb.bid, x:wb.x, y:wb.y, hp:wb.hp, maxHp:wb.maxHp, level:wb.level, name:wb.name });
-        // Daily boss — אם פעיל, שלח לשחקן שנכנס כדי שיראה את ה-HP bar
-        if(dailyBoss){
-          send(ws, 'worldBossSpawn', {
-            bid: dailyBoss.bid, name: dailyBoss.name, level: dailyBoss.level,
-            x: dailyBoss.x, y: dailyBoss.y, hp: dailyBoss.hp, maxHp: dailyBoss.maxHp,
-            daily: true,
-          });
-        }
+      }
+      // Daily boss — שלח תמיד, ללא תלות ב-isNonShared (boss_arena הוא non-shared!)
+      if(dailyBoss){
+        send(ws, 'worldBossSpawn', {
+          bid: dailyBoss.bid, name: dailyBoss.name, level: dailyBoss.level,
+          x: dailyBoss.x, y: dailyBoss.y, hp: dailyBoss.hp, maxHp: dailyBoss.maxHp,
+          daily: true,
+        });
       }
       // System chat
       broadcast('chat', { from: 'מערכת', text: `${p.name} התחבר לעולם`, sys: true });
@@ -595,6 +601,14 @@ function handleMessage(ws, id, msg) {
         ensureCages(st);
         send(ws, "cages", { cages: st.cages });
         send(ws, "monstersSpawn", { monsters: [...st.monsters.values()].map(m=>({mid:m.mid,x:m.x,y:m.y,hp:m.hp,maxHp:m.maxHp,level:m.level,kind:m.kind,cage:m.cage})), full:true });
+      }
+      // Daily boss — שלח תמיד, ללא תלות ב-isNonShared (boss_arena הוא non-shared!)
+      if(dailyBoss){
+        send(ws, 'worldBossSpawn', {
+          bid: dailyBoss.bid, name: dailyBoss.name, level: dailyBoss.level,
+          x: dailyBoss.x, y: dailyBoss.y, hp: dailyBoss.hp, maxHp: dailyBoss.maxHp,
+          daily: true,
+        });
       }
       break;
     }
@@ -733,38 +747,122 @@ function handleMessage(ws, id, msg) {
       if((msg.damage|0) > maxPlausibleHit(authLevel)*1.5) flag(p,'dmg:dailyboss');
       if(dmg <= 0) break;
       dailyBoss.hp -= dmg;
-      // צבירת נזק לכל תורם (לגמול)
+      // צבירת נזק לכל תורם — שומרים גם שם ורמה לטבלה
       const pid = p.account || String(p.id);
-      dailyBoss.contributors[pid] = (dailyBoss.contributors[pid] || 0) + dmg;
+      if(!dailyBoss.contributors[pid]){
+        dailyBoss.contributors[pid] = { dmg: 0, name: p.name, level: authLevel, account: p.account||null };
+      }
+      dailyBoss.contributors[pid].dmg += dmg;
 
       if(dailyBoss.hp <= 0){
         // ── הבוס היומי הובס ──
         const byName = p.name || 'גיבור';
         broadcast('worldBossDead', { bid: dailyBoss.bid, name: dailyBoss.name, byName, daily: true });
         broadcast('chat', { from:'מערכת', text:`🏆 ${dailyBoss.name} הובס! ${byName} נתן את המכה הסופית!`, sys:true });
-        // גמול לכל מי שתרם נזק
-        for(const [cpid] of Object.entries(dailyBoss.contributors)){
-          const sock = findSocketByPlayerId(cpid);
-          if(sock && sock.readyState === 1){
-            const cp = [...players.values()].find(pl=>(pl.account===cpid || String(pl.id)===cpid));
-            if(cp && cp._cs){
-              cp._cs.gold += 100000;
-              const leveled = applyXp(cp._cs, 500000);
+
+        // ── חישוב top 3 נזק ──
+        const contribList = Object.entries(dailyBoss.contributors)
+          .map(([cpid, c]) => ({ cpid, ...c }))
+          .sort((a, b) => b.dmg - a.dmg);
+        const topSet = new Set(contribList.slice(0, 3).map(c => c.cpid));
+
+        // ── שמירת טבלה שבועית ב-Supabase ──
+        const weekId = currentWeekId();
+        for(const c of contribList.slice(0, 100)){
+          sbUpsert('wol_boss_leaderboard', {
+            week_id:    weekId,
+            account:    c.cpid,
+            name:       c.name,
+            level:      c.level,
+            damage:     c.dmg,
+            updated_at: new Date().toISOString(),
+          }, 'week_id,account').catch(()=>{});
+        }
+
+        // ── גמול לכל מי שנמצא ב-boss_arena ──
+        for(const c of contribList){
+          const cp = [...players.values()].find(pl=>(pl.account===c.cpid || String(pl.id)===c.cpid));
+          if(!cp || cp.world !== DAILY_BOSS_CFG.arenaWorld) continue;
+          const sock = cp.ws;
+          if(!sock || sock.readyState !== 1) continue;
+
+          const isTop3   = topSet.has(c.cpid);
+          const isMaxLv  = authLevel >= 250;
+          const xpGain   = isTop3 ? 1000000 : 500000;
+          const goldGain = isTop3 ? 200000  : 100000;
+
+          if(isMaxLv){
+            // ── שחקן מקס רמה: שואלים זהב או חומר יצירה ──
+            // שמור פרס ממתין על השחקן עד שיבחר
+            cp._pendingBossReward = { goldGain, isTop3 };
+            send(sock, 'dailyBossChoice', {
+              name:    dailyBoss.name,
+              gold:    goldGain,
+              isTop3,
+              materials: DAILY_BOSS_MATS,
+            });
+          } else {
+            // ── שחקן רגיל: מקבל XP + זהב ──
+            if(cp._cs){
+              cp._cs.gold += goldGain;
+              const leveled = applyXp(cp._cs, xpGain);
               cp.level = cp._cs.level;
-              send(sock, 'charState', { gold: Math.round(cp._cs.gold), xp: Math.round(cp._cs.xp), level: cp._cs.level, gainXp: 500000, gainGold: 100000, leveled });
+              send(sock, 'charState', { gold: Math.round(cp._cs.gold), xp: Math.round(cp._cs.xp), level: cp._cs.level, gainXp: xpGain, gainGold: goldGain, leveled });
             }
-            send(sock, 'worldBossReward', { name: dailyBoss.name, xp: 500000, gold: 100000, daily: true });
+            send(sock, 'worldBossReward', { name: dailyBoss.name, xp: xpGain, gold: goldGain, isTop3, daily: true });
           }
         }
+
+        // ── שידור טבלת נזק לכולם (top 10 להציג ב-UI) ──
+        broadcast('dailyBossLeaderboard', {
+          week_id: weekId,
+          board:   contribList.slice(0, 10).map((c, i) => ({ rank: i+1, name: c.name, level: c.level, dmg: c.dmg })),
+        });
+
         console.log(`🏆 Daily boss defeated by ${byName}`);
-        dailyBoss = null; // מת עד מחר — lastDailyBossDay כבר מוגדר
+        dailyBoss = null;
       } else {
-        // throttle: שידור HP לכל 200ms כדי לא להציף
+        // throttle: שידור HP לכל 200ms
         const t = Date.now();
         if(t - dailyBoss._lastHpBroadcast > 200){
           dailyBoss._lastHpBroadcast = t;
           broadcast('worldBossHp', { bid: dailyBoss.bid, hp: Math.max(0, dailyBoss.hp), maxHp: dailyBoss.maxHp, daily: true });
         }
+      }
+      break;
+    }
+
+    // שחקן מקס רמה בחר זהב או חומר יצירה
+    case 'dailyBossChoose': {
+      const p = players.get(id); if(!p) break;
+      if(!p._pendingBossReward) break; // אין פרס ממתין
+      const { goldGain, isTop3 } = p._pendingBossReward;
+      p._pendingBossReward = null;
+      if(msg.choice === 'gold'){
+        if(p._cs){ p._cs.gold += goldGain; p._cs.dirty = true; send(p.ws, 'charState', { gold: Math.round(p._cs.gold), xp: Math.round(p._cs.xp), level: p._cs.level, gainGold: goldGain }); }
+        send(p.ws, 'worldBossReward', { name: DAILY_BOSS_CFG.name, gold: goldGain, isTop3, daily: true });
+      } else {
+        // בחר חומר יצירה — בחירה אקראית מהרשימה, כמות כפולה לטופ 3
+        const matId  = DAILY_BOSS_MATS[Math.floor(Math.random() * DAILY_BOSS_MATS.length)];
+        const count  = isTop3 ? 4 : 2;
+        send(p.ws, 'dailyBossMatReward', { matId, count, isTop3, daily: true });
+      }
+      break;
+    }
+
+    // קליינט ביקש את טבלת הנזק השבועית
+    case 'getBossLeaderboard': {
+      const p = players.get(id); if(!p) break;
+      const weekId = currentWeekId();
+      if(SB_ON){
+        sbSelect(`wol_boss_leaderboard?week_id=eq.${weekId}&select=name,level,damage&order=damage.desc&limit=100`)
+          .then(rows => {
+            if(!Array.isArray(rows)) return;
+            send(p.ws, 'dailyBossLeaderboard', {
+              week_id: weekId,
+              board: rows.map((r,i) => ({ rank: i+1, name: r.name, level: r.level, dmg: r.damage })),
+            });
+          }).catch(()=>{});
       }
       break;
     }
