@@ -597,9 +597,15 @@ function handleMessage(ws, id, msg) {
       p.account = (msg.account || '').slice(0,40);
       p.slot = msg.slot|0;
       p.isGM = false;
-      // ── GUILD: re-link THIS CHARACTER to its guild (membership is per-character
-      //    and persists), and keep the member's display name/level fresh. ──
-      if(p.account){
+      p.authed = false;
+      const _claimedAcct = p.account;
+      const _pwHash = String(msg.pwHash || '');
+      // ── Grant this account's powers (guild link, AUTHORITATIVE economy, GM) ONLY after the
+      //    claimed identity proves its password. This single gate closes account-takeover AND
+      //    GM-impersonation: you can no longer get someone's gold/XP or GM rights by merely
+      //    claiming their username. ──
+      const grantAccountPowers = ()=>{
+        p.authed = true;
         const ck = pcKey(p);
         if(accountGuild.has(ck)){
           const g = guilds.get(accountGuild.get(ck));
@@ -607,22 +613,39 @@ function handleMessage(ws, id, msg) {
             p.guild = g.name;
             g.members.set(ck, { name: p.name, level: p.level });
             send(ws, 'guildInfo', { guild: guildPub(g) });
-            pushGuildInfo(g); // refresh others' member levels
+            pushGuildInfo(g);
           } else { accountGuild.delete(ck); }
         }
-      }
-      if(p.account){
         loadCharState(p.account, p.slot, { gold: msg.gold|0, level: p.level }).then(cs=>{
           p._cs = cs;
-          // server's values are authoritative — push them to the client
-          p.level = cs.level;
+          p.level = cs.level; // server's economy is authoritative
           send(ws, 'charState', { gold: Math.round(cs.gold), xp: Math.round(cs.xp), level: cs.level });
         });
-        // verify GM status from the DB (authoritative — a client can't fake being a GM)
-        if(SB_ON){
-          sbSelect(`wol_accounts?username=eq.${encodeURIComponent(p.account)}&select=is_admin`).then(rows=>{
-            if(rows && rows.length && rows[0].is_admin===true){ p.isGM = true; console.log(`[GM] ${p.name} authenticated as GM`); }
-          }).catch(()=>{});
+        sbSelect(`wol_accounts?username=eq.${encodeURIComponent(p.account)}&select=is_admin`).then(rows=>{
+          if(rows && rows.length && rows[0].is_admin===true){ p.isGM = true; console.log(`[GM] ${p.name} authenticated as GM`); }
+        }).catch(()=>{});
+      };
+      if(_claimedAcct){
+        if(!SB_ON){
+          grantAccountPowers(); // no cloud DB (offline/dev): nothing to verify against
+        } else {
+          // ── IDENTITY CHECK: the claimed account must present the matching password hash ──
+          sbSelect(`wol_accounts?username=eq.${encodeURIComponent(_claimedAcct)}&select=pw_hash`).then(rows=>{
+            if(rows && rows.length){
+              if(_pwHash && rows[0].pw_hash && String(rows[0].pw_hash) === _pwHash){
+                grantAccountPowers();                         // ✓ verified — safe to grant
+              } else {
+                flag(p, 'auth:badpw');                        // ✗ wrong password = impersonation attempt
+                console.log(`[AUTH] rejected ${p.name} claiming '${_claimedAcct}' — bad password`);
+                p.account = '';                               // no economy, no GM, no guild binding
+                send(ws, 'authError', { reason: 'אימות נכשל — סיסמה שגויה' });
+              }
+            } else {
+              console.log(`[AUTH] no cloud account '${_claimedAcct}' — playing unverified`);
+              p.account = '';                                 // unknown identity → no bound powers
+              send(ws, 'authError', { reason: 'החשבון לא נמצא בענן' });
+            }
+          }).catch(()=>{ p.account=''; });                    // DB error → fail safe (no powers)
         }
       }
       // Send the new player the list of everyone already in their world
